@@ -61,14 +61,15 @@ Known packaging quirks (both benign, both hit in practice):
 ## 5. Verify
 
 The binary self-reports the stock upstream version string (the patch set doesn't bump it) —
-identify builds by **sha256**, not the About dialog. The 0.6.0 release asset:
+identify builds by **sha256**, not the About dialog. The 0.6.0 release asset (flicker fix
+default-on):
 
 ```
 rpcs3-etk_gtk-edition-0.6.0_v0.0.41-19544-60c9705a_linux_aarch64.AppImage
-sha256 d1d40d8aac70db1d0d9dfe9bf8de89cc9c04c28196f0f3c91720138779a24986
+sha256 1d0b490da981c3e05783fa621dcb4f5cdc7a5f48e380dafe8f111bbeb2ed80e8
 ```
 
-Deploy to a ROCKNIX rig with ETK: set `RPCS3_APPIMAGE` (and
-`RPCS3_ENV_FLAGS="GTK_REMAP0_ONE=1"`) in `etk.conf`, run `./install.sh`, reboot — the kit
-bind-mounts it over the read-only stock `rpcs3-sa` every boot (stock is never modified;
-clearing the flag reverts).
+Deploy to a ROCKNIX rig with ETK: set `RPCS3_APPIMAGE` in `etk.conf`, run `./install.sh`,
+reboot — the kit bind-mounts it over the read-only stock `rpcs3-sa` every boot (stock is never
+modified; clearing the flag reverts). No env flags needed: the road-flicker fix is on by
+default (`GTK_REMAP0_ONE=0` is the diagnostic kill-switch).

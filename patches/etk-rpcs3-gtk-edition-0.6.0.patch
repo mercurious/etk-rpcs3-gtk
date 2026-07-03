@@ -168,10 +168,10 @@ index 557c7ef13..7a568d7b7 100644
  	ringbuffer.reset();
  
 diff --git a/rpcs3/Emu/RSX/RSXTexture.cpp b/rpcs3/Emu/RSX/RSXTexture.cpp
-index 0d18cf0cd..650c356d0 100644
+index 0d18cf0cd..3b840d048 100644
 --- a/rpcs3/Emu/RSX/RSXTexture.cpp
 +++ b/rpcs3/Emu/RSX/RSXTexture.cpp
-@@ -243,6 +243,34 @@ namespace rsx
+@@ -243,6 +243,42 @@ namespace rsx
  	rsx::texture_channel_remap_t fragment_texture::decoded_remap() const
  	{
  		u32 remap_ctl = registers[NV4097_SET_TEXTURE_CONTROL1 + (m_index * 8)];
@@ -182,25 +182,33 @@ index 0d18cf0cd..650c356d0 100644
 +		// whole track renders shadowed; real hardware evidently treats the parked state as neutral.
 +		// v2 (2026-07-02, after on-rig A/B): scoped to the exact confirmed signature — fully zeroed
 +		// low word AND a 1x1 texture (on-rig probe showed the 1x1 is the ONLY zero-remap texture in
-+		// live GT5P). Two runtime-gated decodes to discriminate what console "neutral" means:
-+		//   GTK_REMAP0_ONE=1      -> ONE x4 (content-independent "no shadow"; kills content-staleness
-+		//                            blips if the 1x1's texel is meaningless on console)
-+		//   GTK_REMAP0_IDENTITY=1 -> identity crossbar (samples the 1x1's live content; correct if the
-+		//                            game legitimately animates it as a global dimmer, e.g. tunnels)
-+		// ONE wins when both are set. v1's blanket zero-control-field override caused short new
-+		// flicker blips (track-dependent) and is retired.
-+		static const bool g_gtk_remap0_one = []() { const char* e = std::getenv("GTK_REMAP0_ONE"); return e && *e == '1'; }();
++		// live GT5P). Two decodes discriminate what console "neutral" means:
++		//   ONE x4            -> content-independent "no shadow" (kills content-staleness blips
++		//                        if the 1x1's texel is meaningless on console)
++		//   identity crossbar -> samples the 1x1's live content (correct if the game legitimately
++		//                        animates it as a global dimmer, e.g. tunnels)
++		// v1's blanket zero-control-field override caused short new flicker blips and is retired.
++		// v3 (0.6.0 GA): the ONE decode is ON BY DEFAULT — it is the hardware-matching
++		// interpretation (field-validated flicker-free, Eiger/Daytona) and the old opt-in gate
++		// was a leftover of the A/B bench, not a decision. Runtime controls:
++		//   GTK_REMAP0_ONE=0      -> kill-switch: stock zero-decode (diagnosis/regression A/B)
++		//   GTK_REMAP0_IDENTITY=1 -> identity-crossbar A/B variant
++		//   GTK_REMAP0_ONE=1      -> explicit ONE; outranks IDENTITY (preserves the v2 contract)
++		static const char* const s_gtk_remap0_env = std::getenv("GTK_REMAP0_ONE");
++		static const bool g_gtk_remap0_one_explicit = s_gtk_remap0_env && *s_gtk_remap0_env == '1';
++		static const bool g_gtk_remap0_off = s_gtk_remap0_env && *s_gtk_remap0_env == '0';
 +		static const bool g_gtk_remap0_identity = []() { const char* e = std::getenv("GTK_REMAP0_IDENTITY"); return e && *e == '1'; }();
-+		if ((g_gtk_remap0_one || g_gtk_remap0_identity) && (remap_ctl & 0xFFFF) == 0
++		const bool gtk_use_identity = g_gtk_remap0_identity && !g_gtk_remap0_one_explicit;
++		if ((!g_gtk_remap0_off || g_gtk_remap0_identity) && (remap_ctl & 0xFFFF) == 0
 +			&& width() <= 1 && height() <= 1) [[unlikely]]
 +		{
 +			static atomic_t<bool> s_logged = false;
 +			if (!s_logged.exchange(true))
 +			{
 +				rsx_log.warning("GTK-REMAP0: %s override engaged (TIU%u raw=0x%08x)",
-+					g_gtk_remap0_one ? "force-ONE" : "identity", m_index, remap_ctl);
++					gtk_use_identity ? "identity" : "force-ONE", m_index, remap_ctl);
 +			}
-+			remap_ctl = (remap_ctl & 0xFFFF0000u) | (g_gtk_remap0_one ? 0x55E4u : 0xAAE4u);
++			remap_ctl = (remap_ctl & 0xFFFF0000u) | (gtk_use_identity ? 0xAAE4u : 0x55E4u);
 +		}
 +
  		u32 remap_override = (remap_ctl >> 16) & 0xFFFF;
