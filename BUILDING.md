@@ -69,7 +69,9 @@ rpcs3-etk_gtk-edition-0.6.0_v0.0.41-19544-60c9705a_linux_aarch64.AppImage
 sha256 1d0b490da981c3e05783fa621dcb4f5cdc7a5f48e380dafe8f111bbeb2ed80e8
 ```
 
-Deploy to a ROCKNIX rig with ETK: set `RPCS3_APPIMAGE` in `etk.conf`, run `./install.sh`,
-reboot — the kit bind-mounts it over the read-only stock `rpcs3-sa` every boot (stock is never
-modified; clearing the flag reverts). No env flags needed: the road-flicker fix is on by
-default (`GTK_REMAP0_ONE=0` is the diagnostic kill-switch).
+Deploy to a ROCKNIX rig with ETK: nothing to configure — **ETK ≥0.6.0 fetches and deploys this
+exact build automatically** (`install.sh` STEP 6.55, sha256-verified against the pin above) and
+bind-mounts it over the read-only stock `rpcs3-sa` every boot (stock is never modified;
+`RPCS3_APPIMAGE="stock"` in etk.conf opts out). Point `RPCS3_APPIMAGE` at a local file only to
+stage your own dev build. No env flags needed: the road-flicker fix is on by default
+(`GTK_REMAP0_ONE=0` is the diagnostic kill-switch).
