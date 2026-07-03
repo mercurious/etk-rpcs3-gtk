@@ -1,0 +1,338 @@
+diff --git a/rpcs3/Emu/Cell/Modules/cellAudio.cpp b/rpcs3/Emu/Cell/Modules/cellAudio.cpp
+index 557c7ef13..7a568d7b7 100644
+--- a/rpcs3/Emu/Cell/Modules/cellAudio.cpp
++++ b/rpcs3/Emu/Cell/Modules/cellAudio.cpp
+@@ -10,9 +10,71 @@
+ #include "util/video_provider.h"
+ 
+ #include <cmath>
++#include <cstdio>
++#include <ctime>
+ 
+ LOG_CHANNEL(cellAudio);
+ 
++// =========================================================================
++// ETK GTK-Edition audio telemetry (aud1) — counters only, ZERO behavior
++// change. Backend underruns are otherwise silent zero/last-sample fill with
++// no log line at any level, so audible stutter leaves no forensic trace.
++// One raw text line is exported to /dev/shm/rpcs3_audio_stat every ~2 s for
++// the ETK ledger/HUD (atomic tmp+rename, ETK HUD law). Counters reset at
++// cellAudio thread start: a DRM-spawn title's second guest boot re-zeroes,
++// so end-of-session values describe the game proper, not the launcher.
++// =========================================================================
++struct etk_audio_stats_t
++{
++	atomic_t<u64> underrun_events{0}; // backend pulled more than the ring held (cubeb thread)
++	atomic_t<u64> underrun_bytes{0};  // total shortfall bytes (silence-filled downstream)
++	u64 skipped_periods = 0;          // cellAudio advanced past untouched buffers (game fell behind)
++	u64 silence_periods = 0;          // fully-untouched periods enqueued as silence
++	f32 ratio_min = 1.0f;             // lowest time-stretch frequency ratio since start
++	u64 start_us = 0;                 // emu clock at reset
++};
++static etk_audio_stats_t s_etk_aud{};
++
++static void etk_audio_stats_dump(u64 timestamp_us, f32 cur_ratio, u64 enqueued_playtime_us, u32 buf_ms)
++{
++#ifdef __linux__
++	char line[256];
++	const int n = std::snprintf(line, sizeof(line),
++		"up_s=%.1f ur=%llu urb=%llu skip=%llu sil=%llu ratio=%.3f rmin=%.3f enq_ms=%.1f buf_ms=%u\n",
++		(timestamp_us - s_etk_aud.start_us) / 1'000'000.0,
++		static_cast<unsigned long long>(s_etk_aud.underrun_events.load()),
++		static_cast<unsigned long long>(s_etk_aud.underrun_bytes.load()),
++		static_cast<unsigned long long>(s_etk_aud.skipped_periods),
++		static_cast<unsigned long long>(s_etk_aud.silence_periods),
++		cur_ratio, s_etk_aud.ratio_min,
++		enqueued_playtime_us / 1000.0, buf_ms);
++	if (n <= 0) return;
++
++	// Snapshot: latest values, atomically swapped (ETK ledger reads this at post-mortem)
++	if (std::FILE* f = std::fopen("/dev/shm/rpcs3_audio_stat.tmp", "w"))
++	{
++		std::fwrite(line, 1, static_cast<usz>(n), f);
++		std::fclose(f);
++		std::rename("/dev/shm/rpcs3_audio_stat.tmp", "/dev/shm/rpcs3_audio_stat");
++	}
++
++	// aud2: wall-clock-stamped timeline append — one line per dump, so a mixed
++	// session (TT -> ghost -> pack race) decomposes into phases post-hoc and
++	// correlates with the MangoHud fps autolog by epoch. Truncated at counter
++	// reset (fresh per guest boot); size-capped so an hours-long session can
++	// never balloon SHM (~150 KB/h at the 2 s cadence, 2 MB cap ≈ 13 h).
++	if (std::FILE* tl = std::fopen("/dev/shm/rpcs3_audio_log", "a"))
++	{
++		std::fseek(tl, 0, SEEK_END);
++		if (std::ftell(tl) < 2 * 1024 * 1024)
++		{
++			std::fprintf(tl, "ep=%llu %s", static_cast<unsigned long long>(std::time(nullptr)), line);
++		}
++		std::fclose(tl);
++	}
++#endif
++}
++
+ extern atomic_t<recording_mode> g_recording_mode;
+ 
+ extern void lv2_sleep(u64 timeout, ppu_thread* ppu = nullptr);
+@@ -186,6 +248,12 @@ f32 audio_ringbuffer::set_frequency_ratio(f32 new_ratio)
+ {
+ 	frequency_ratio = static_cast<f32>(resampler.set_tempo(new_ratio));
+ 
++	// ETK aud1: track deepest stretch engagement (cellAudio thread only)
++	if (frequency_ratio < s_etk_aud.ratio_min)
++	{
++		s_etk_aud.ratio_min = frequency_ratio;
++	}
++
+ 	return frequency_ratio;
+ }
+ 
+@@ -200,7 +268,17 @@ u32 audio_ringbuffer::backend_write_callback(u32 size, void *buf)
+ {
+ 	if (!backend_active.observe()) backend_active = true;
+ 
+-	return static_cast<u32>(cb_ringbuf.pop(buf, size, true));
++	const u32 popped = static_cast<u32>(cb_ringbuf.pop(buf, size, true));
++
++	// ETK aud1: the shortfall below is filled with silence/last-sample by the
++	// backend with no trace — this counter is the only witness. (cubeb thread)
++	if (popped < size)
++	{
++		s_etk_aud.underrun_events++;
++		s_etk_aud.underrun_bytes += size - popped;
++	}
++
++	return popped;
+ }
+ 
+ void audio_ringbuffer::backend_state_callback(AudioStateEvent event)
+@@ -713,6 +791,18 @@ void cell_audio_thread::operator()()
+ 
+ 	u32 loop_count = 0;
+ 
++	// ETK aud1: fresh counters per guest boot (DRM-spawn second init re-zeroes)
++	s_etk_aud.underrun_events = 0;
++	s_etk_aud.underrun_bytes = 0;
++	s_etk_aud.skipped_periods = 0;
++	s_etk_aud.silence_periods = 0;
++	s_etk_aud.ratio_min = 1.0f;
++	s_etk_aud.start_us = get_system_time();
++	u64 etk_last_dump_us = 0;
++#ifdef __linux__
++	std::remove("/dev/shm/rpcs3_audio_log"); // aud2: fresh timeline per guest boot
++#endif
++
+ 	// Main cellAudio loop
+ 	while (thread_ctrl::state() != thread_state::aborting)
+ 	{
+@@ -753,6 +843,14 @@ void cell_audio_thread::operator()()
+ 
+ 		const u64 time_since_last_period = timestamp - m_last_period_end;
+ 
++		// ETK aud1: telemetry export (~2 s cadence; /dev/shm write is memory-only)
++		if (timestamp - etk_last_dump_us > 2'000'000)
++		{
++			etk_audio_stats_dump(timestamp, ringbuffer->get_frequency_ratio(),
++				ringbuffer->get_enqueued_playtime(), static_cast<u32>(cfg.raw.desired_buffer_duration));
++			etk_last_dump_us = timestamp;
++		}
++
+ 		// Handle audio restart
+ 		if (m_audio_should_restart)
+ 		{
+@@ -915,6 +1013,7 @@ void cell_audio_thread::operator()()
+ 				{
+ 					// There's no audio in the buffers, simply advance time and hope the game recovers
+ 					cellAudio.trace("advancing time: untouched=%u/%u (expected=%u), enqueued_buffers=%llu", untouched, active_ports, untouched_expected, enqueued_buffers);
++					s_etk_aud.skipped_periods++; // ETK aud1: game fell behind an audio period
+ 					untouched_expected = untouched;
+ 					advance(timestamp);
+ 					continue;
+@@ -930,6 +1029,7 @@ void cell_audio_thread::operator()()
+ 			{
+ 				// There's no audio in the buffers, simply advance time
+ 				cellAudio.trace("enqueuing silence: untouched=%u/%u (expected=%u), enqueued_buffers=%llu", untouched, active_ports, untouched_expected, enqueued_buffers);
++				s_etk_aud.silence_periods++; // ETK aud1: a fully-silent period shipped to the backend
+ 				ringbuffer->enqueue_silence();
+ 				untouched_expected = untouched;
+ 				advance(timestamp);
+@@ -1017,6 +1117,10 @@ void cell_audio_thread::operator()()
+ 		advance(timestamp);
+ 	}
+ 
++	// ETK aud1: final dump so post-mortem reads end-of-session values, not a ≤2s-stale line
++	etk_audio_stats_dump(get_system_time(), ringbuffer->get_frequency_ratio(),
++		ringbuffer->get_enqueued_playtime(), static_cast<u32>(cfg.raw.desired_buffer_duration));
++
+ 	// Destroy ringbuffer
+ 	ringbuffer.reset();
+ 
+diff --git a/rpcs3/Emu/RSX/RSXTexture.cpp b/rpcs3/Emu/RSX/RSXTexture.cpp
+index 0d18cf0cd..650c356d0 100644
+--- a/rpcs3/Emu/RSX/RSXTexture.cpp
++++ b/rpcs3/Emu/RSX/RSXTexture.cpp
+@@ -243,6 +243,34 @@ namespace rsx
+ 	rsx::texture_channel_remap_t fragment_texture::decoded_remap() const
+ 	{
+ 		u32 remap_ctl = registers[NV4097_SET_TEXTURE_CONTROL1 + (m_index * 8)];
++
++		// ETK GTK experiment (11912 road-flicker, dossier Tier0_11912_ShadowRemapLocalization_20260702):
++		// GT5P parks its shadow-map TIU on a 1x1 fallback with a fully zeroed CONTROL1 (= FORCE-ZERO x4
++		// per the GCM enum) -> every track draw samples a constant-0 shadow-visibility term and the
++		// whole track renders shadowed; real hardware evidently treats the parked state as neutral.
++		// v2 (2026-07-02, after on-rig A/B): scoped to the exact confirmed signature — fully zeroed
++		// low word AND a 1x1 texture (on-rig probe showed the 1x1 is the ONLY zero-remap texture in
++		// live GT5P). Two runtime-gated decodes to discriminate what console "neutral" means:
++		//   GTK_REMAP0_ONE=1      -> ONE x4 (content-independent "no shadow"; kills content-staleness
++		//                            blips if the 1x1's texel is meaningless on console)
++		//   GTK_REMAP0_IDENTITY=1 -> identity crossbar (samples the 1x1's live content; correct if the
++		//                            game legitimately animates it as a global dimmer, e.g. tunnels)
++		// ONE wins when both are set. v1's blanket zero-control-field override caused short new
++		// flicker blips (track-dependent) and is retired.
++		static const bool g_gtk_remap0_one = []() { const char* e = std::getenv("GTK_REMAP0_ONE"); return e && *e == '1'; }();
++		static const bool g_gtk_remap0_identity = []() { const char* e = std::getenv("GTK_REMAP0_IDENTITY"); return e && *e == '1'; }();
++		if ((g_gtk_remap0_one || g_gtk_remap0_identity) && (remap_ctl & 0xFFFF) == 0
++			&& width() <= 1 && height() <= 1) [[unlikely]]
++		{
++			static atomic_t<bool> s_logged = false;
++			if (!s_logged.exchange(true))
++			{
++				rsx_log.warning("GTK-REMAP0: %s override engaged (TIU%u raw=0x%08x)",
++					g_gtk_remap0_one ? "force-ONE" : "identity", m_index, remap_ctl);
++			}
++			remap_ctl = (remap_ctl & 0xFFFF0000u) | (g_gtk_remap0_one ? 0x55E4u : 0xAAE4u);
++		}
++
+ 		u32 remap_override = (remap_ctl >> 16) & 0xFFFF;
+ 
+ 		switch (format() & ~(CELL_GCM_TEXTURE_LN | CELL_GCM_TEXTURE_UN))
+diff --git a/rpcs3/Emu/RSX/RSXThread.cpp b/rpcs3/Emu/RSX/RSXThread.cpp
+index a2435dcff..f6e71e70e 100644
+--- a/rpcs3/Emu/RSX/RSXThread.cpp
++++ b/rpcs3/Emu/RSX/RSXThread.cpp
+@@ -2234,6 +2234,39 @@ namespace rsx
+ 			auto &tex = m_ctx->register_state->fragment_textures[i];
+ 			current_fp_texture_state.clear(i);
+ 
++			// ETK GTK probe (11912 road-flicker): transition-gated TIU state log, enabled via
++			// GTK_PROBE_11912=1. The dim<->lit flip signature is the shadow-map TIU swapping
++			// depth<->color class with a zeroed CONTROL1 remap-control field
++			// (dossier Tier0_11912_ShadowRemapLocalization_20260702).
++			static const bool g_gtk_probe_11912 = []() { const char* e = std::getenv("GTK_PROBE_11912"); return e && *e == '1'; }();
++			if (g_gtk_probe_11912) [[unlikely]]
++			{
++				static u32 s_last_remap[16] = {};
++				static u32 s_last_state[16] = {};
++				static u32 s_last_texel[16] = {};
++				const u32 raw_remap = tex.remap();
++				const u32 state = (static_cast<u32>(sampler_descriptors[i]->format_class) << 1) | (tex.enabled() ? 1u : 0u);
++				// v2: for the parked-shadow 1x1 (zero remap), also watch the guest texel's
++				// live CONTENT — discriminates game-animated dimmer vs stale cache vs static.
++				u32 texel = 0;
++				if (raw_remap == 0 && tex.width() <= 1 && tex.height() <= 1)
++				{
++					if (const u32 texaddr = get_address(tex.offset(), tex.location(), 4))
++					{
++						texel = vm::_ref<const u32>(texaddr);
++					}
++				}
++				if (s_last_remap[i] != raw_remap || s_last_state[i] != state || s_last_texel[i] != texel)
++				{
++					rsx_log.warning("GTK-PROBE-11912 TIU%u: remap=0x%08x class=%u enabled=%u dims=%ux%u zfunc=%u fmt=0x%x texel=0x%08x",
++						i, raw_remap, static_cast<u32>(sampler_descriptors[i]->format_class), tex.enabled() ? 1u : 0u,
++						tex.width(), tex.height(), static_cast<u32>(tex.zfunc()), static_cast<u32>(tex.format()), texel);
++					s_last_remap[i] = raw_remap;
++					s_last_state[i] = state;
++					s_last_texel[i] = texel;
++				}
++			}
++
+ 			if (!tex.enabled() || sampler_descriptors[i]->format_class == RSX_FORMAT_CLASS_UNDEFINED)
+ 			{
+ 				continue;
+diff --git a/rpcs3/Emu/RSX/VK/VKPresent.cpp b/rpcs3/Emu/RSX/VK/VKPresent.cpp
+index b5ba9c460..f20d3ca17 100644
+--- a/rpcs3/Emu/RSX/VK/VKPresent.cpp
++++ b/rpcs3/Emu/RSX/VK/VKPresent.cpp
+@@ -5,6 +5,7 @@
+ #include "Emu/RSX/Overlays/overlay_manager.h"
+ #include "Emu/RSX/Overlays/overlay_debug_overlay.h"
+ #include "Emu/Cell/Modules/cellVideoOut.h"
++#include "Emu/System.h"
+ 
+ #include "upscalers/bilinear_pass.hpp"
+ #include "upscalers/fsr_pass.h"
+@@ -129,7 +130,26 @@ bool VKGSRender::reinitialize_swapchain()
+ 
+ 	// Flush the command buffer
+ 	close_and_submit_command_buffer(&resize_fence);
+-	vk::wait_for_fence(&resize_fence);
++	// ETK Tier 1 (787B reframe / Lead D, gt5p-boss-lsd-iteration 2026-07-01):
++	// second call site for the same fix as commands.cpp's command_buffer::begin().
++	// This was an unbounded wait_for_fence(&resize_fence) (default timeout=0) -
++	// live-confirmed 2026-07-01: a real a6xx fault (status=00E79587) left
++	// rsx::thread busy-spinning HERE, not at the commands.cpp site Tier 1
++	// originally patched, so the first patch alone didn't catch this hang.
++	// The boss can wedge at either fence wait depending on where in the frame
++	// (mid-draw vs. swapchain resize) it lands when the GPU is lost.
++	const VkResult wait_result = vk::wait_for_fence(&resize_fence, GENERAL_WAIT_TIMEOUT);
++	if (wait_result != VK_SUCCESS) [[unlikely]]
++	{
++		// Do NOT proceed to reset()/reuse the command buffer or swapchain state -
++		// the prior submission's GPU work is in an unknown state (timed out or
++		// the device is lost), so continuing now would race a still-possibly-
++		// live submission or corrupt state on the next frame.
++		rsx_log.fatal("GPU fence wait failed (VkResult=%d) after %uus during swapchain reinit - GPU is likely hung or lost. Stopping emulation.",
++			static_cast<s32>(wait_result), static_cast<u32>(GENERAL_WAIT_TIMEOUT));
++		Emu.Kill(false, false);
++		return false;
++	}
+ 
+ 	m_current_command_buffer->reset();
+ 	m_current_command_buffer->begin();
+diff --git a/rpcs3/Emu/RSX/VK/vkutils/commands.cpp b/rpcs3/Emu/RSX/VK/vkutils/commands.cpp
+index 549d557af..845295e74 100644
+--- a/rpcs3/Emu/RSX/VK/vkutils/commands.cpp
++++ b/rpcs3/Emu/RSX/VK/vkutils/commands.cpp
+@@ -3,6 +3,10 @@
+ #include "shared.h"
+ #include "sync.h"
+ 
++#include "Emu/RSX/VK/VKGSRenderTypes.hpp"
++#include "Emu/System.h"
++#include "util/logs.hpp"
++
+ namespace vk
+ {
+ 	// This queue flushing method to be implemented by the backend as behavior depends on config
+@@ -87,7 +91,29 @@ namespace vk
+ 	{
+ 		if (m_submit_fence && is_pending)
+ 		{
+-			wait_for_fence(m_submit_fence);
++			// ETK Tier 1 (787B reframe / Lead D, gt5p-boss-lsd-iteration 2026-07-01):
++			// this used to call wait_for_fence(m_submit_fence) with the default
++			// timeout=0, which spins forever on vkGetFenceStatus and NEVER routes
++			// through Turnip's msm_device_check_status fault-detection (only the
++			// bounded vkWaitForFences path does, per vk_common_WaitForFences ->
++			// vk_device_check_status). Live-confirmed on-rig 2x (different tracks,
++			// different a6xx fault signatures): rsx::thread busy-spins here
++			// (State: R, wchan=0) for the entire GPU-hang window with nothing
++			// watching, requiring a human R3 SIGKILL. A bounded wait converts an
++			// unrecoverable silent wedge into a detected, logged, clean stop.
++			const VkResult wait_result = wait_for_fence(m_submit_fence, GENERAL_WAIT_TIMEOUT);
++			if (wait_result != VK_SUCCESS) [[unlikely]]
++			{
++				// Do NOT proceed to reset()/reuse this command buffer - its prior
++				// submission's GPU work is in an unknown state (timed out or the
++				// device is lost), so resetting it now would race a still-possibly-
++				// live submission or corrupt state on the next recording pass.
++				rsx_log.fatal("GPU fence wait failed (VkResult=%d) after %uus - GPU is likely hung or lost. Stopping emulation.",
++					static_cast<s32>(wait_result), static_cast<u32>(GENERAL_WAIT_TIMEOUT));
++				Emu.Kill(false, false);
++				return;
++			}
++
+ 			is_pending = false;
+ 
+ 			//CHECK_RESULT(vkResetFences(pool->get_owner(), 1, &m_submit_fence));
