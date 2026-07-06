@@ -1,0 +1,770 @@
+diff --git a/Utilities/Thread.cpp b/Utilities/Thread.cpp
+index abe6a108f..c9b5f90cc 100644
+--- a/Utilities/Thread.cpp
++++ b/Utilities/Thread.cpp
+@@ -1,5 +1,15 @@
+ #include "stdafx.h"
+ #include "Emu/System.h"
++
++#include <cstdlib>
++
++// Device-lost latch (Emu/RSX/VK/vkutils/shared.cpp). Forward-declared to keep
++// Vulkan headers out of core utilities; resolved at link in this fork's
++// always-Vulkan binary. Used by the stuck-join hard-exit below.
++namespace vk
++{
++	bool is_device_lost();
++}
+ #include "Emu/Cell/SPUThread.h"
+ #include "Emu/Cell/PPUThread.h"
+ #include "Emu/Cell/lv2/sys_mmapper.h"
+@@ -2805,7 +2815,25 @@ bool thread_base::join(bool dtor) const
+ 
+ 		if (i >= 16 && !(i & (i - 1)) && timeout != atomic_wait_timeout::inf)
+ 		{
+-			sig_log.error("Thread [%s] is too sleepy. Waiting for it %.3fus already!", *m_tname.load(), (utils::get_tsc() - stamp0) / (utils::get_tsc_freq() / 1000000.));
++			const f64 waited_us = (utils::get_tsc() - stamp0) / (utils::get_tsc_freq() / 1000000.);
++			sig_log.error("Thread [%s] is too sleepy. Waiting for it %.3fus already!", *m_tname.load(), waited_us);
++
++			// Under a GPU device loss a stuck join is unwinnable in
++			// principle: a thread that emergency-exited on a DEVICE_LOST
++			// fatal dies WITHOUT unwinding, so any lock it held is orphaned
++			// (observed live 2026-07-04: PPU thread died holding the
++			// texture_cache shared_mutex; rsx::thread blocked on it forever;
++			// this join then waited on rsx doubling into the minutes). The
++			// process is stopping anyway — after 15 s, abandon the teardown
++			// outright. _Exit skips all remaining joins and destructors,
++			// which on a dead device is correct by construction (the kernel
++			// reclaims device objects and memory; persistent state was
++			// already flushed by the stop request).
++			if (waited_us > 15'000'000. && vk::is_device_lost())
++			{
++				sig_log.error("Device lost and join stuck for %.1fs: abandoning teardown, hard exit.", waited_us / 1000000.);
++				std::_Exit(0);
++			}
+ 		}
+ 	}
+ 
+diff --git a/rpcs3/Emu/Cell/Modules/cellAudio.cpp b/rpcs3/Emu/Cell/Modules/cellAudio.cpp
+index 557c7ef13..7a568d7b7 100644
+--- a/rpcs3/Emu/Cell/Modules/cellAudio.cpp
++++ b/rpcs3/Emu/Cell/Modules/cellAudio.cpp
+@@ -10,9 +10,71 @@
+ #include "util/video_provider.h"
+ 
+ #include <cmath>
++#include <cstdio>
++#include <ctime>
+ 
+ LOG_CHANNEL(cellAudio);
+ 
++// =========================================================================
++// ETK GTK-Edition audio telemetry (aud1) — counters only, ZERO behavior
++// change. Backend underruns are otherwise silent zero/last-sample fill with
++// no log line at any level, so audible stutter leaves no forensic trace.
++// One raw text line is exported to /dev/shm/rpcs3_audio_stat every ~2 s for
++// the ETK ledger/HUD (atomic tmp+rename, ETK HUD law). Counters reset at
++// cellAudio thread start: a DRM-spawn title's second guest boot re-zeroes,
++// so end-of-session values describe the game proper, not the launcher.
++// =========================================================================
++struct etk_audio_stats_t
++{
++	atomic_t<u64> underrun_events{0}; // backend pulled more than the ring held (cubeb thread)
++	atomic_t<u64> underrun_bytes{0};  // total shortfall bytes (silence-filled downstream)
++	u64 skipped_periods = 0;          // cellAudio advanced past untouched buffers (game fell behind)
++	u64 silence_periods = 0;          // fully-untouched periods enqueued as silence
++	f32 ratio_min = 1.0f;             // lowest time-stretch frequency ratio since start
++	u64 start_us = 0;                 // emu clock at reset
++};
++static etk_audio_stats_t s_etk_aud{};
++
++static void etk_audio_stats_dump(u64 timestamp_us, f32 cur_ratio, u64 enqueued_playtime_us, u32 buf_ms)
++{
++#ifdef __linux__
++	char line[256];
++	const int n = std::snprintf(line, sizeof(line),
++		"up_s=%.1f ur=%llu urb=%llu skip=%llu sil=%llu ratio=%.3f rmin=%.3f enq_ms=%.1f buf_ms=%u\n",
++		(timestamp_us - s_etk_aud.start_us) / 1'000'000.0,
++		static_cast<unsigned long long>(s_etk_aud.underrun_events.load()),
++		static_cast<unsigned long long>(s_etk_aud.underrun_bytes.load()),
++		static_cast<unsigned long long>(s_etk_aud.skipped_periods),
++		static_cast<unsigned long long>(s_etk_aud.silence_periods),
++		cur_ratio, s_etk_aud.ratio_min,
++		enqueued_playtime_us / 1000.0, buf_ms);
++	if (n <= 0) return;
++
++	// Snapshot: latest values, atomically swapped (ETK ledger reads this at post-mortem)
++	if (std::FILE* f = std::fopen("/dev/shm/rpcs3_audio_stat.tmp", "w"))
++	{
++		std::fwrite(line, 1, static_cast<usz>(n), f);
++		std::fclose(f);
++		std::rename("/dev/shm/rpcs3_audio_stat.tmp", "/dev/shm/rpcs3_audio_stat");
++	}
++
++	// aud2: wall-clock-stamped timeline append — one line per dump, so a mixed
++	// session (TT -> ghost -> pack race) decomposes into phases post-hoc and
++	// correlates with the MangoHud fps autolog by epoch. Truncated at counter
++	// reset (fresh per guest boot); size-capped so an hours-long session can
++	// never balloon SHM (~150 KB/h at the 2 s cadence, 2 MB cap ≈ 13 h).
++	if (std::FILE* tl = std::fopen("/dev/shm/rpcs3_audio_log", "a"))
++	{
++		std::fseek(tl, 0, SEEK_END);
++		if (std::ftell(tl) < 2 * 1024 * 1024)
++		{
++			std::fprintf(tl, "ep=%llu %s", static_cast<unsigned long long>(std::time(nullptr)), line);
++		}
++		std::fclose(tl);
++	}
++#endif
++}
++
+ extern atomic_t<recording_mode> g_recording_mode;
+ 
+ extern void lv2_sleep(u64 timeout, ppu_thread* ppu = nullptr);
+@@ -186,6 +248,12 @@ f32 audio_ringbuffer::set_frequency_ratio(f32 new_ratio)
+ {
+ 	frequency_ratio = static_cast<f32>(resampler.set_tempo(new_ratio));
+ 
++	// ETK aud1: track deepest stretch engagement (cellAudio thread only)
++	if (frequency_ratio < s_etk_aud.ratio_min)
++	{
++		s_etk_aud.ratio_min = frequency_ratio;
++	}
++
+ 	return frequency_ratio;
+ }
+ 
+@@ -200,7 +268,17 @@ u32 audio_ringbuffer::backend_write_callback(u32 size, void *buf)
+ {
+ 	if (!backend_active.observe()) backend_active = true;
+ 
+-	return static_cast<u32>(cb_ringbuf.pop(buf, size, true));
++	const u32 popped = static_cast<u32>(cb_ringbuf.pop(buf, size, true));
++
++	// ETK aud1: the shortfall below is filled with silence/last-sample by the
++	// backend with no trace — this counter is the only witness. (cubeb thread)
++	if (popped < size)
++	{
++		s_etk_aud.underrun_events++;
++		s_etk_aud.underrun_bytes += size - popped;
++	}
++
++	return popped;
+ }
+ 
+ void audio_ringbuffer::backend_state_callback(AudioStateEvent event)
+@@ -713,6 +791,18 @@ void cell_audio_thread::operator()()
+ 
+ 	u32 loop_count = 0;
+ 
++	// ETK aud1: fresh counters per guest boot (DRM-spawn second init re-zeroes)
++	s_etk_aud.underrun_events = 0;
++	s_etk_aud.underrun_bytes = 0;
++	s_etk_aud.skipped_periods = 0;
++	s_etk_aud.silence_periods = 0;
++	s_etk_aud.ratio_min = 1.0f;
++	s_etk_aud.start_us = get_system_time();
++	u64 etk_last_dump_us = 0;
++#ifdef __linux__
++	std::remove("/dev/shm/rpcs3_audio_log"); // aud2: fresh timeline per guest boot
++#endif
++
+ 	// Main cellAudio loop
+ 	while (thread_ctrl::state() != thread_state::aborting)
+ 	{
+@@ -753,6 +843,14 @@ void cell_audio_thread::operator()()
+ 
+ 		const u64 time_since_last_period = timestamp - m_last_period_end;
+ 
++		// ETK aud1: telemetry export (~2 s cadence; /dev/shm write is memory-only)
++		if (timestamp - etk_last_dump_us > 2'000'000)
++		{
++			etk_audio_stats_dump(timestamp, ringbuffer->get_frequency_ratio(),
++				ringbuffer->get_enqueued_playtime(), static_cast<u32>(cfg.raw.desired_buffer_duration));
++			etk_last_dump_us = timestamp;
++		}
++
+ 		// Handle audio restart
+ 		if (m_audio_should_restart)
+ 		{
+@@ -915,6 +1013,7 @@ void cell_audio_thread::operator()()
+ 				{
+ 					// There's no audio in the buffers, simply advance time and hope the game recovers
+ 					cellAudio.trace("advancing time: untouched=%u/%u (expected=%u), enqueued_buffers=%llu", untouched, active_ports, untouched_expected, enqueued_buffers);
++					s_etk_aud.skipped_periods++; // ETK aud1: game fell behind an audio period
+ 					untouched_expected = untouched;
+ 					advance(timestamp);
+ 					continue;
+@@ -930,6 +1029,7 @@ void cell_audio_thread::operator()()
+ 			{
+ 				// There's no audio in the buffers, simply advance time
+ 				cellAudio.trace("enqueuing silence: untouched=%u/%u (expected=%u), enqueued_buffers=%llu", untouched, active_ports, untouched_expected, enqueued_buffers);
++				s_etk_aud.silence_periods++; // ETK aud1: a fully-silent period shipped to the backend
+ 				ringbuffer->enqueue_silence();
+ 				untouched_expected = untouched;
+ 				advance(timestamp);
+@@ -1017,6 +1117,10 @@ void cell_audio_thread::operator()()
+ 		advance(timestamp);
+ 	}
+ 
++	// ETK aud1: final dump so post-mortem reads end-of-session values, not a ≤2s-stale line
++	etk_audio_stats_dump(get_system_time(), ringbuffer->get_frequency_ratio(),
++		ringbuffer->get_enqueued_playtime(), static_cast<u32>(cfg.raw.desired_buffer_duration));
++
+ 	// Destroy ringbuffer
+ 	ringbuffer.reset();
+ 
+diff --git a/rpcs3/Emu/Io/PadHandler.cpp b/rpcs3/Emu/Io/PadHandler.cpp
+index 178ae9f4f..0459f47cc 100644
+--- a/rpcs3/Emu/Io/PadHandler.cpp
++++ b/rpcs3/Emu/Io/PadHandler.cpp
+@@ -444,11 +444,23 @@ void PadHandlerBase::TranslateButtonPress(const std::shared_ptr<PadDevice>& devi
+ 
+ 	if (get_is_left_trigger(device, keyCode))
+ 	{
++		// Top-end range calibration: a trigger that physically saturates below
++		// trigger_max can never report a full pull. When 'Left Trigger Max' is
++		// set (0 = uncalibrated), rescale so the calibrated ceiling maps to
++		// full deflection. Applied before the threshold compare.
++		if (const u32 cal_max = device->config->ltriggermax; cal_max > 0 && cal_max < trigger_max)
++		{
++			val = static_cast<u16>(std::min<u32>(trigger_max, static_cast<u32>(val) * trigger_max / cal_max));
++		}
+ 		pressed = val > (ignore_trigger_threshold ? 0 : device->config->ltriggerthreshold);
+ 		val = pressed ? NormalizeTriggerInput(val, device->config->ltriggerthreshold) : 0;
+ 	}
+ 	else if (get_is_right_trigger(device, keyCode))
+ 	{
++		if (const u32 cal_max = device->config->rtriggermax; cal_max > 0 && cal_max < trigger_max)
++		{
++			val = static_cast<u16>(std::min<u32>(trigger_max, static_cast<u32>(val) * trigger_max / cal_max));
++		}
+ 		pressed = val > (ignore_trigger_threshold ? 0 : device->config->rtriggerthreshold);
+ 		val = pressed ? NormalizeTriggerInput(val, device->config->rtriggerthreshold) : 0;
+ 	}
+diff --git a/rpcs3/Emu/Io/pad_config.h b/rpcs3/Emu/Io/pad_config.h
+index 86779c085..d7f7f5d6f 100644
+--- a/rpcs3/Emu/Io/pad_config.h
++++ b/rpcs3/Emu/Io/pad_config.h
+@@ -126,6 +126,11 @@ struct cfg_pad final : cfg::node
+ 	cfg::uint<0, 1000000> rstick_anti_deadzone{ this, "Right Stick Anti-Deadzone", 0 };
+ 	cfg::uint<0, 1000000> ltriggerthreshold{ this, "Left Trigger Threshold", 0 };
+ 	cfg::uint<0, 1000000> rtriggerthreshold{ this, "Right Trigger Threshold", 0 };
++	// Top-end range calibration: raw axis value (handler units) treated as a
++	// full pull. 0 = uncalibrated (stock behavior). For triggers that
++	// physically saturate below the handler's full range.
++	cfg::uint<0, 1000000> ltriggermax{ this, "Left Trigger Max", 0 };
++	cfg::uint<0, 1000000> rtriggermax{ this, "Right Trigger Max", 0 };
+ 	cfg::uint<0, 1000000> lpadsquircling{ this, "Left Pad Squircling Factor", 4000 };
+ 	cfg::uint<0, 1000000> rpadsquircling{ this, "Right Pad Squircling Factor", 4000 };
+ 
+diff --git a/rpcs3/Emu/RSX/VK/VKGSRenderTypes.hpp b/rpcs3/Emu/RSX/VK/VKGSRenderTypes.hpp
+index 0b80a5d4e..dc0e98b08 100644
+--- a/rpcs3/Emu/RSX/VK/VKGSRenderTypes.hpp
++++ b/rpcs3/Emu/RSX/VK/VKGSRenderTypes.hpp
+@@ -90,7 +90,28 @@ namespace vk
+ 				return false;
+ 			}
+ 
+-			if (vkGetFenceStatus(pool->get_owner(), m_submit_fence->handle) == VK_SUCCESS)
++			VkResult fence_status = vkGetFenceStatus(pool->get_owner(), m_submit_fence->handle);
++			if (fence_status != VK_SUCCESS)
++			{
++				// ETK fence force-signal: this is the ONE poll site outside
++				// wait_for_fence — the hard-sync present-queue drain
++				// (`while (!m_queued_frames.empty()) check_present_status();`)
++				// spins HERE with no timeout and no escalation. Live-proven
++				// 2026-07-05 (GT HD, 00E5 flip wedge): post-hangcheck this
++				// fence never signals and the drain spins forever. Age the
++				// fence; at the threshold, drive through the normal
++				// completion path below exactly as if it signaled.
++				if (vk::etk_fence_note_not_ready(m_submit_fence))
++				{
++					fence_status = VK_SUCCESS;
++				}
++			}
++			else
++			{
++				vk::etk_fence_note_signaled(m_submit_fence);
++			}
++
++			if (fence_status == VK_SUCCESS)
+ 			{
+ 				lock.upgrade();
+ 
+diff --git a/rpcs3/Emu/RSX/VK/VKPresent.cpp b/rpcs3/Emu/RSX/VK/VKPresent.cpp
+index b5ba9c460..b8a8d9385 100644
+--- a/rpcs3/Emu/RSX/VK/VKPresent.cpp
++++ b/rpcs3/Emu/RSX/VK/VKPresent.cpp
+@@ -2,9 +2,11 @@
+ #include "VKGSRender.h"
+ #include "vkutils/buffer_object.h"
+ #include "vkutils/memory.h"
++#include "vkutils/shared.h"
+ #include "Emu/RSX/Overlays/overlay_manager.h"
+ #include "Emu/RSX/Overlays/overlay_debug_overlay.h"
+ #include "Emu/Cell/Modules/cellVideoOut.h"
++#include "Emu/System.h"
+ 
+ #include "upscalers/bilinear_pass.hpp"
+ #include "upscalers/fsr_pass.h"
+@@ -129,7 +131,27 @@ bool VKGSRender::reinitialize_swapchain()
+ 
+ 	// Flush the command buffer
+ 	close_and_submit_command_buffer(&resize_fence);
+-	vk::wait_for_fence(&resize_fence);
++	// ETK Tier 1 (787B reframe / Lead D, gt5p-boss-lsd-iteration 2026-07-01):
++	// second call site for the same fix as commands.cpp's command_buffer::begin().
++	// This was an unbounded wait_for_fence(&resize_fence) (default timeout=0) -
++	// live-confirmed 2026-07-01: a real a6xx fault (status=00E79587) left
++	// rsx::thread busy-spinning HERE, not at the commands.cpp site Tier 1
++	// originally patched, so the first patch alone didn't catch this hang.
++	// The boss can wedge at either fence wait depending on where in the frame
++	// (mid-draw vs. swapchain resize) it lands when the GPU is lost.
++	const VkResult wait_result = vk::wait_for_fence(&resize_fence, GENERAL_WAIT_TIMEOUT);
++	if (wait_result != VK_SUCCESS) [[unlikely]]
++	{
++		// Do NOT proceed to reset()/reuse the command buffer or swapchain state -
++		// the prior submission's GPU work is in an unknown state (timed out or
++		// the device is lost), so continuing now would race a still-possibly-
++		// live submission or corrupt state on the next frame.
++		rsx_log.fatal("GPU fence wait failed (VkResult=%d) after %uus during swapchain reinit - GPU is likely hung or lost. Stopping emulation.",
++			static_cast<s32>(wait_result), static_cast<u32>(GENERAL_WAIT_TIMEOUT));
++		vk::mark_device_lost();
++		Emu.Kill(false, false);
++		return false;
++	}
+ 
+ 	m_current_command_buffer->reset();
+ 	m_current_command_buffer->begin();
+@@ -164,6 +186,14 @@ void VKGSRender::present(vk::frame_context_t *ctx)
+ 		default:
+ 			// Other errors not part of rpcs3. This can be caused by 3rd party injectors with bad code, of which we have no control over.
+ 			// Let the application attempt to recover instead of crashing outright.
++			if (error == VK_ERROR_DEVICE_LOST)
++			{
++				// Latch the loss at first sight so the reinit/teardown that
++				// follows never calls back into the dead device/layer chain
++				// (post-loss swapchain destroy segfaulted 2-for-2 on a6xx
++				// hangcheck recovery; see vkutils/shared.h teardown guard).
++				vk::mark_device_lost();
++			}
+ 			rsx_log.error("VkPresent returned unexpected error code %lld. Will attempt to recreate the swapchain. Please disable 3rd party injector tools.", static_cast<s64>(error));
+ 			swapchain_unavailable = true;
+ 			break;
+diff --git a/rpcs3/Emu/RSX/VK/vkutils/commands.cpp b/rpcs3/Emu/RSX/VK/vkutils/commands.cpp
+index 549d557af..17ee421f1 100644
+--- a/rpcs3/Emu/RSX/VK/vkutils/commands.cpp
++++ b/rpcs3/Emu/RSX/VK/vkutils/commands.cpp
+@@ -3,6 +3,10 @@
+ #include "shared.h"
+ #include "sync.h"
+ 
++#include "Emu/RSX/VK/VKGSRenderTypes.hpp"
++#include "Emu/System.h"
++#include "util/logs.hpp"
++
+ namespace vk
+ {
+ 	// This queue flushing method to be implemented by the backend as behavior depends on config
+@@ -87,7 +91,30 @@ namespace vk
+ 	{
+ 		if (m_submit_fence && is_pending)
+ 		{
+-			wait_for_fence(m_submit_fence);
++			// ETK Tier 1 (787B reframe / Lead D, gt5p-boss-lsd-iteration 2026-07-01):
++			// this used to call wait_for_fence(m_submit_fence) with the default
++			// timeout=0, which spins forever on vkGetFenceStatus and NEVER routes
++			// through Turnip's msm_device_check_status fault-detection (only the
++			// bounded vkWaitForFences path does, per vk_common_WaitForFences ->
++			// vk_device_check_status). Live-confirmed on-rig 2x (different tracks,
++			// different a6xx fault signatures): rsx::thread busy-spins here
++			// (State: R, wchan=0) for the entire GPU-hang window with nothing
++			// watching, requiring a human R3 SIGKILL. A bounded wait converts an
++			// unrecoverable silent wedge into a detected, logged, clean stop.
++			const VkResult wait_result = wait_for_fence(m_submit_fence, GENERAL_WAIT_TIMEOUT);
++			if (wait_result != VK_SUCCESS) [[unlikely]]
++			{
++				// Do NOT proceed to reset()/reuse this command buffer - its prior
++				// submission's GPU work is in an unknown state (timed out or the
++				// device is lost), so resetting it now would race a still-possibly-
++				// live submission or corrupt state on the next recording pass.
++				rsx_log.fatal("GPU fence wait failed (VkResult=%d) after %uus - GPU is likely hung or lost. Stopping emulation.",
++					static_cast<s32>(wait_result), static_cast<u32>(GENERAL_WAIT_TIMEOUT));
++				vk::mark_device_lost();
++				Emu.Kill(false, false);
++				return;
++			}
++
+ 			is_pending = false;
+ 
+ 			//CHECK_RESULT(vkResetFences(pool->get_owner(), 1, &m_submit_fence));
+diff --git a/rpcs3/Emu/RSX/VK/vkutils/shared.cpp b/rpcs3/Emu/RSX/VK/vkutils/shared.cpp
+index c4a0219e6..803a7d73c 100644
+--- a/rpcs3/Emu/RSX/VK/vkutils/shared.cpp
++++ b/rpcs3/Emu/RSX/VK/vkutils/shared.cpp
+@@ -2,6 +2,8 @@
+ #include "shared.h"
+ #include "util/logs.hpp"
+ 
++#include <atomic>
++
+ #ifndef _WIN32
+ #include <signal.h>
+ #endif
+@@ -10,6 +12,20 @@ namespace vk
+ {
+ 	extern void print_debug_markers();
+ 
++	// Teardown guard latch: once the device is lost, destructors must not
++	// call back into the driver/layer chain (see shared.h).
++	static std::atomic<bool> g_device_lost_flag{ false };
++
++	void mark_device_lost()
++	{
++		g_device_lost_flag = true;
++	}
++
++	bool is_device_lost()
++	{
++		return g_device_lost_flag.load();
++	}
++
+ 	std::string retrieve_device_fault_info()
+ 	{
+ 		if (!g_render_device || !g_render_device->get_extended_device_fault_support())
+@@ -131,6 +147,7 @@ namespace vk
+ 			break;
+ 		case VK_ERROR_DEVICE_LOST:
+ 			error_message = "Device lost (Driver crashed with unspecified error or stopped responding and recovered) (VK_ERROR_DEVICE_LOST)";
++			mark_device_lost();
+ 			extra_info = retrieve_device_fault_info();
+ 			break;
+ 		case VK_ERROR_MEMORY_MAP_FAILED:
+diff --git a/rpcs3/Emu/RSX/VK/vkutils/shared.h b/rpcs3/Emu/RSX/VK/vkutils/shared.h
+index f8ffcc103..9b75a765b 100644
+--- a/rpcs3/Emu/RSX/VK/vkutils/shared.h
++++ b/rpcs3/Emu/RSX/VK/vkutils/shared.h
+@@ -10,6 +10,13 @@ namespace vk
+ 
+ 	void die_with_error(VkResult error_code, std::string message = {}, std::source_location src_loc = std::source_location::current());
+ 
++	// Sticky device-loss latch (teardown guard). Set the moment any path sees
++	// VK_ERROR_DEVICE_LOST; consulted during teardown so destructors never
++	// call back into a dead device/layer chain (post-loss swapchain destroy
++	// segfaulted 2-for-2: null-PFN exec, and a torn layer-hook deref).
++	void mark_device_lost();
++	bool is_device_lost();
++
+ 	VKAPI_ATTR VkBool32 VKAPI_CALL dbgFunc(VkFlags msgFlags, VkDebugReportObjectTypeEXT objType,
+ 	                                       u64 srcObject, usz location, s32 msgCode,
+ 	                                       const char *pLayerPrefix, const char *pMsg, void *pUserData);
+diff --git a/rpcs3/Emu/RSX/VK/vkutils/swapchain.cpp b/rpcs3/Emu/RSX/VK/vkutils/swapchain.cpp
+index fe4464cb0..6502d8bec 100644
+--- a/rpcs3/Emu/RSX/VK/vkutils/swapchain.cpp
++++ b/rpcs3/Emu/RSX/VK/vkutils/swapchain.cpp
+@@ -1,5 +1,6 @@
+ #include "stdafx.h"
+ #include "swapchain.h"
++#include "shared.h"
+ 
+ namespace vk
+ {
+@@ -137,7 +138,14 @@ namespace vk
+ 	{
+ 		if (VkDevice pdev = dev)
+ 		{
+-			if (m_vk_swapchain)
++			// Teardown guard: after a device loss aborts a swapchain reinit,
++			// this object can hold a swapchain handle with a null or torn
++			// dispatch pointer — calling it segfaulted 2-for-2 on live a6xx
++			// hangcheck recoveries (bare null-PFN exec, and a freed
++			// layer-hook deref with an overlay layer loaded). On a lost
++			// device the kernel reclaims driver objects at process exit;
++			// skipping the destroy call is correct, not a leak.
++			if (m_vk_swapchain && _vkDestroySwapchainKHR && !vk::is_device_lost())
+ 			{
+ 				_vkDestroySwapchainKHR(pdev, m_vk_swapchain, nullptr);
+ 			}
+diff --git a/rpcs3/Emu/RSX/VK/vkutils/sync.cpp b/rpcs3/Emu/RSX/VK/vkutils/sync.cpp
+index 6d36283ca..3b0f96182 100644
+--- a/rpcs3/Emu/RSX/VK/vkutils/sync.cpp
++++ b/rpcs3/Emu/RSX/VK/vkutils/sync.cpp
+@@ -7,10 +7,14 @@
+ #include "shared.h"
+ 
+ #include "Emu/Cell/timers.hpp"
++#include "Emu/RSX/Overlays/overlay_message.h"
+ 
+ #include "util/sysinfo.hpp"
+ #include "util/asm.hpp"
+ 
++#include <chrono>
++#include <cstdlib>
++
+ namespace vk
+ {
+ 	namespace globals
+@@ -168,6 +172,10 @@ namespace vk
+ 	{
+ 		vkResetFences(owner, 1, &handle);
+ 		flushed.release(false);
++		// ETK: a reset fence starts a fresh life — clear the staleness stamp
++		// or reused fences would inherit age (same rule as t3devlost4).
++		etk_stale_since_us.release(0);
++		etk_stale_warned.release(false);
+ 	}
+ 
+ 	void fence::signal_flushed()
+@@ -559,13 +567,139 @@ namespace vk
+ 		);
+ 	}
+ 
++	// ETK fence force-signal ("drive-through") — see the doc block in sync.h.
++	// The policy lives HERE, inside wait_for_fence, so every wait site in the
++	// backend (the tguard-bounded commands.cpp/VKPresent.cpp waits AND the
++	// legacy timeout=0 spins) inherits it without per-site edits: a forced
++	// fence returns VK_SUCCESS and the caller continues down its normal
++	// completion path. The one non-wait_for_fence poll site (poke() in
++	// VKGSRenderTypes.hpp, the GT HD hard-sync drain) calls the note_*
++	// helpers directly.
++	bool etk_fence_force_enabled()
++	{
++		static const bool enabled = []()
++		{
++			const char* v = std::getenv("GTK_FENCE_FORCE_SIGNAL");
++			return v && *v == '1';
++		}();
++		return enabled;
++	}
++
++	static u64 etk_fence_force_threshold_us()
++	{
++		static const u64 threshold = []() -> u64
++		{
++			if (const char* v = std::getenv("GTK_FENCE_FORCE_SIGNAL_MS"))
++			{
++				if (const u64 ms = std::strtoull(v, nullptr, 10))
++				{
++					return ms * 1000ull;
++				}
++			}
++			// 5 s: far above any legitimate fence latency on this rig
++			// (frame fences signal in ms; shader-compile stalls are CPU-side
++			// and never hold a submitted fence this long), far below the
++			// operator's R3 reflex.
++			return 5'000'000ull;
++		}();
++		return threshold;
++	}
++
++	static u64 etk_steady_now_us()
++	{
++		return std::chrono::duration_cast<std::chrono::microseconds>(
++			std::chrono::steady_clock::now().time_since_epoch()).count();
++	}
++
++	static atomic_t<u64> g_etk_fence_forced_count = 0;
++
++	// Player-facing rescue notice (operator request 2026-07-05): the freeze is
++	// noticeable, so tell the driver to stay at the controls. Queued via
++	// RPCS3's native overlay the moment a stall crosses the warn threshold —
++	// the overlay renders through the present path, so the message physically
++	// appears at the FIRST frame after the rescue (kernel-alone recovery or
++	// force-signal), which is exactly when control returns.
++	static constexpr u64 ETK_STALL_WARN_US = 1'500'000;
++
++	static void etk_queue_rescue_notice(const char* text, u64 expiration_us)
++	{
++		rsx::overlays::queue_message(std::string(text), expiration_us);
++	}
++
++	bool etk_fence_note_not_ready(fence* pfence)
++	{
++		if (!etk_fence_force_enabled())
++		{
++			return false;
++		}
++
++		const u64 now = etk_steady_now_us();
++		const u64 since = pfence->etk_stale_since_us;
++		if (!since)
++		{
++			pfence->etk_stale_since_us.release(now);
++			return false;
++		}
++		if (now - since >= ETK_STALL_WARN_US && !pfence->etk_stale_warned.exchange(true))
++		{
++			etk_queue_rescue_notice("GTK RESCUE: RECOVERING FROM CRASH - STANDBY, KEEP AT THE CONTROLS", 8'000'000);
++		}
++		if (now - since < etk_fence_force_threshold_us())
++		{
++			return false;
++		}
++
++		pfence->etk_stale_since_us.release(0);
++		pfence->etk_stale_warned.release(false);
++		const u64 n = ++g_etk_fence_forced_count;
++		rsx_log.error("ETK fence force-signal #%llu: fence stuck NOT_READY for >%llums (post-hangcheck orphan) - force-completing and continuing (GTK_FENCE_FORCE_SIGNAL).",
++			n, etk_fence_force_threshold_us() / 1000);
++		etk_queue_rescue_notice("GTK RESCUE: CRASH ABSORBED - DRIVE ON", 5'000'000);
++		return true;
++	}
++
++	void etk_fence_note_signaled(fence* pfence)
++	{
++		const u64 since = pfence->etk_stale_since_us;
++		if (since)
++		{
++			// Kernel-alone survive: the fence came back on its own after a
++			// noticeable stall (the 2026-07-05 21:56 GT5P shape). Same
++			// driver-facing message as the forced path — the player doesn't
++			// care which layer caught it.
++			if (etk_steady_now_us() - since >= ETK_STALL_WARN_US)
++			{
++				etk_queue_rescue_notice("GTK RESCUE: CRASH ABSORBED - DRIVE ON", 5'000'000);
++			}
++			pfence->etk_stale_since_us.release(0);
++			pfence->etk_stale_warned.release(false);
++		}
++	}
++
+ 	VkResult wait_for_fence(fence* pFence, u64 timeout)
+ 	{
+ 		pFence->wait_flush();
+ 
+ 		if (timeout)
+ 		{
+-			return vkWaitForFences(*g_render_device, 1, &pFence->handle, VK_FALSE, timeout * 1000ull);
++			VkResult result = vkWaitForFences(*g_render_device, 1, &pFence->handle, VK_FALSE, timeout * 1000ull);
++			// ETK drive-through: don't hand VK_TIMEOUT to the caller (whose
++			// policy is Emu.Kill) while the force-signal window is still
++			// aging — keep waiting in bounded slices and force-complete at
++			// the threshold. Flag off => identical to stock (single wait).
++			while (result == VK_TIMEOUT && etk_fence_force_enabled())
++			{
++				if (etk_fence_note_not_ready(pFence))
++				{
++					return VK_SUCCESS; // forced — caller continues normally
++				}
++				result = vkWaitForFences(*g_render_device, 1, &pFence->handle, VK_FALSE, 250'000'000ull); // 250 ms slice
++			}
++			if (result == VK_SUCCESS)
++			{
++				etk_fence_note_signaled(pFence);
++			}
++			return result;
+ 		}
+ 		else
+ 		{
+@@ -574,6 +708,10 @@ namespace vk
+ 				switch (status)
+ 				{
+ 				case VK_NOT_READY:
++					if (etk_fence_note_not_ready(pFence))
++					{
++						return VK_SUCCESS; // forced — see sync.h doc block
++					}
+ 					utils::pause();
+ 					continue;
+ 				default:
+@@ -582,6 +720,7 @@ namespace vk
+ 				}
+ 			}
+ 
++			etk_fence_note_signaled(pFence);
+ 			return VK_SUCCESS;
+ 		}
+ 	}
+diff --git a/rpcs3/Emu/RSX/VK/vkutils/sync.h b/rpcs3/Emu/RSX/VK/vkutils/sync.h
+index 9177e8411..5fc3e1067 100644
+--- a/rpcs3/Emu/RSX/VK/vkutils/sync.h
++++ b/rpcs3/Emu/RSX/VK/vkutils/sync.h
+@@ -24,6 +24,16 @@ namespace vk
+ 		VkFence handle         = VK_NULL_HANDLE;
+ 		VkDevice owner         = VK_NULL_HANDLE;
+ 
++		// ETK fence force-signal ("drive-through", 2026-07-05): steady-clock us
++		// of the first NOT_READY observation on THIS fence; 0 = not stale.
++		// Cleared on every observed signal and on reset(), so per-frame fence
++		// reuse cannot age. See etk_fence_note_not_ready() in sync.cpp.
++		atomic_t<u64> etk_stale_since_us = 0;
++		// One-shot per stale episode: the "RESCUING FROM CRASH" player
++		// notification has been queued for this episode. Cleared with the
++		// stamp (signal/reset) so a later episode warns again.
++		atomic_t<bool> etk_stale_warned = false;
++
+ 		fence(VkDevice dev);
+ 		~fence();
+ 		fence(const fence&) = delete;
+@@ -35,6 +45,20 @@ namespace vk
+ 		operator bool() const;
+ 	};
+ 
++	// ETK fence force-signal (GTK stack, 2026-07-05). Under the KGSL-parity
++	// kernel a hangcheck recovery keeps the GPU context alive, but a fence
++	// whose submission depended on the dropped submit will NEVER signal
++	// (proven live: GT HD frozen 20 s+, GPU idle, rsx spinning ~350% CPU).
++	// When armed (GTK_FENCE_FORCE_SIGNAL=1) a fence continuously NOT_READY
++	// past the threshold (GTK_FENCE_FORCE_SIGNAL_MS, default 5000) is
++	// force-completed at the emulator level: log, treat as signaled, present
++	// one garbage frame, keep racing. Default-off => behavior-identical to
++	// the tguard fast-exit build, so the two policies A/B via RPCS3_ENV_FLAGS
++	// without a rebuild.
++	bool etk_fence_force_enabled();
++	bool etk_fence_note_not_ready(fence* pfence);  // true => force-complete NOW
++	void etk_fence_note_signaled(fence* pfence);
++
+ 	class event
+ 	{
+ 		enum class sync_backend
+diff --git a/rpcs3/rpcs3.cpp b/rpcs3/rpcs3.cpp
+index 2fa4e8cb6..ea8094d4a 100644
+--- a/rpcs3/rpcs3.cpp
++++ b/rpcs3/rpcs3.cpp
+@@ -88,6 +88,13 @@ static semaphore<> s_qt_init;
+ atomic_t<bool> g_headless = false;
+ static atomic_t<bool> s_no_gui = false;
+ static atomic_t<char*> s_argv0 = nullptr;
++
++// Device-lost latch (vkutils/shared.cpp). Forward-declared to keep the
++// Vulkan headers out of the main TU; linked from the same binary.
++namespace vk
++{
++	bool is_device_lost();
++}
+ static bool s_is_error_launch = false;
+ 
+ std::string g_input_config_override;
+@@ -368,8 +375,29 @@ public:
+ 					rsx::overlays::queue_message(overlay_msg, umax);
+ 				}
+ 
+-				// Pause emulation if fatal error encountered
+-				Emu.Pause(true);
++				// After a GPU device loss, Pause would freeze the session
++				// forever (nothing can resume on a dead device) and preempt
++				// the clean stop — observed live 2026-07-04 (Path B): a
++				// worker thread's DEVICE_LOST fatal landed here before the
++				// bounded-wait Kill path could run, leaving the game frozen
++				// on-screen with 83 live threads. The vk device-lost latch is
++				// set at first sight of the loss (before any fatal can fire),
++				// so route to a clean Kill instead; the guarded swapchain
++				// teardown handles the rest. Fire-once so a fatal storm
++				// during the Kill teardown cannot re-enter.
++				if (vk::is_device_lost())
++				{
++					static atomic_t<bool> s_devlost_kill_once = false;
++					if (!s_devlost_kill_once.exchange(true))
++					{
++						Emu.Kill(false, false);
++					}
++				}
++				else
++				{
++					// Pause emulation if fatal error encountered
++					Emu.Pause(true);
++				}
+ 			}
+ 		}
+ 	}

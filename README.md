@@ -23,7 +23,14 @@ to build the identical binary yourself is in [`BUILDING.md`](BUILDING.md).
 > - `patches/etk-rpcs3-gtk-edition-0.6.1-dev-tguard-v6.patch` — tguard dev cumulative
 >   (14 files / ~388 insertions): everything in 0.6.0 **plus** the tguard device-loss
 >   crash-net (v1–v6), trigger top-end calibration, and the audio timeline logger.
-> - `patches/etk-rpcs3-gtk-edition-0.6.1-dev-ffs-v1.patch` — current dev cumulative
+> - `patches/etk-rpcs3-gtk-edition-0.6.1-dev-ffs-v2.patch` — **current** dev cumulative
+>   (~459 insertions): ffs-v1 **plus** the player-facing rescue notice via RPCS3's
+>   native overlay — "GTK RESCUE: RECOVERING FROM CRASH - STANDBY, KEEP AT THE
+>   CONTROLS" queues the moment a fence stall crosses 1.5 s and physically appears
+>   at the first frame after the rescue (which is exactly when control returns),
+>   followed by "CRASH ABSORBED - DRIVE ON" whether the kernel recovered the fence
+>   alone or the force-signal fired.
+> - `patches/etk-rpcs3-gtk-edition-0.6.1-dev-ffs-v1.patch` — prior dev cumulative
 >   (~424 insertions): everything above **plus** the fence force-signal
 >   "drive-through" (`GTK_FENCE_FORCE_SIGNAL=1`, threshold `GTK_FENCE_FORCE_SIGNAL_MS`,
 >   default 5000 ms): under a kernel that keeps the GPU context alive across a hang
