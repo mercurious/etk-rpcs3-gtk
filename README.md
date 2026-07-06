@@ -20,9 +20,19 @@ to build the identical binary yourself is in [`BUILDING.md`](BUILDING.md).
 > Upstream is the canonical source; this repository carries the delta as a single reviewed
 > cumulative patch per release:
 > - `patches/etk-rpcs3-gtk-edition-0.6.0.patch` — 0.6.0 GA (5 files / ~214 insertions)
-> - `patches/etk-rpcs3-gtk-edition-0.6.1-dev-tguard-v6.patch` — current dev cumulative
+> - `patches/etk-rpcs3-gtk-edition-0.6.1-dev-tguard-v6.patch` — tguard dev cumulative
 >   (14 files / ~388 insertions): everything in 0.6.0 **plus** the tguard device-loss
 >   crash-net (v1–v6), trigger top-end calibration, and the audio timeline logger.
+> - `patches/etk-rpcs3-gtk-edition-0.6.1-dev-ffs-v1.patch` — current dev cumulative
+>   (~424 insertions): everything above **plus** the fence force-signal
+>   "drive-through" (`GTK_FENCE_FORCE_SIGNAL=1`, threshold `GTK_FENCE_FORCE_SIGNAL_MS`,
+>   default 5000 ms): under a kernel that keeps the GPU context alive across a hang
+>   recovery (rocknix-gtk `msm.context_keepalive=1`), a fence stuck NOT_READY past
+>   the threshold is force-completed — one garbage frame and the race continues,
+>   instead of a frozen game or a teardown. Covers both the bounded tguard waits
+>   (inside `vk::wait_for_fence`) and the hard-sync present-queue drain (`poke()`),
+>   the live-proven GT HD freeze site. Default-off: flag unset = tguard-v6
+>   fast-exit behavior, so the two crash policies A/B without a rebuild.
 
 Kept as a thin patches repo (matching the etk-turnip-gtk convention) rather than a full
 source-tree fork: the delta is small, reviewable in one sitting, and applies cleanly with
