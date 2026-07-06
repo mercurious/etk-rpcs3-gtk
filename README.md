@@ -23,7 +23,17 @@ to build the identical binary yourself is in [`BUILDING.md`](BUILDING.md).
 > - `patches/etk-rpcs3-gtk-edition-0.6.1-dev-tguard-v6.patch` — tguard dev cumulative
 >   (14 files / ~388 insertions): everything in 0.6.0 **plus** the tguard device-loss
 >   crash-net (v1–v6), trigger top-end calibration, and the audio timeline logger.
-> - `patches/etk-rpcs3-gtk-edition-0.6.1-dev-ffs-v2.patch` — **current** dev cumulative
+> - `patches/etk-rpcs3-gtk-edition-0.6.1-dev-ffs-v3.patch` — **current** dev cumulative
+>   (14 files / ~548 insertions): ffs-v2 **plus** anti-lock stage 2, the RSX progress
+>   watchdog (`GTK_RSX_WATCHDOG=1`, threshold `GTK_RSX_WATCHDOG_S` default 10 s): after a
+>   kernel hang-rescue drops a guest-visible completion, the game can park polling for it
+>   with the FIFO permanently empty (proven live twice, cross-title, identical gdb
+>   signatures — no VkFence stale, so the fence net is blind). The watchdog detects
+>   in-game FIFO starvation, force-syncs ZCULL (pending reports write their sinks; dead
+>   queries forge zero via the GTK driver's query-survive instead of blocking), and if the
+>   FIFO still doesn't move by 2x threshold, stops emulation cleanly — a ledger row and an
+>   auto-relaunch instead of a frozen handheld. Default-off.
+> - `patches/etk-rpcs3-gtk-edition-0.6.1-dev-ffs-v2.patch` — prior dev cumulative
 >   (~459 insertions): ffs-v1 **plus** the player-facing rescue notice via RPCS3's
 >   native overlay — "GTK RESCUE: RECOVERING FROM CRASH - STANDBY, KEEP AT THE
 >   CONTROLS" queues the moment a fence stall crosses 1.5 s and physically appears
