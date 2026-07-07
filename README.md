@@ -23,7 +23,21 @@ to build the identical binary yourself is in [`BUILDING.md`](BUILDING.md).
 > - `patches/etk-rpcs3-gtk-edition-0.6.1-dev-tguard-v6.patch` — tguard dev cumulative
 >   (14 files / ~388 insertions): everything in 0.6.0 **plus** the tguard device-loss
 >   crash-net (v1–v6), trigger top-end calibration, and the audio timeline logger.
-> - `patches/etk-rpcs3-gtk-edition-0.6.1-dev-ffs-v3.patch` — **current** dev cumulative
+> - `patches/etk-rpcs3-gtk-edition-0.6.1-dev-ffs-v4.patch` — **current** dev cumulative
+>   (15 files / ~649 insertions): ffs-v3 **plus** anti-lock stage 3b, the FIFO-desync
+>   resync net (`GTK_FIFO_RESYNC=1`, budget `GTK_FIFO_RESYNC_TRIES` default 10). A burst
+>   of kernel hang-rescues drops many submits' guest-visible effects; the resulting RSX
+>   command-FIFO desync *storm* trips RPCS3's own "hopeless" give-up in `recover_fifo()`
+>   (20 recoveries in <2 s), which throws and kills `rsx::thread` — leaving the guest
+>   deadlocked *alive* (SPUs parked in `get_ch_value` awaiting reports that never land;
+>   captured live with a full gdb bundle, distinct from the stage-2 park: the FIFO goes
+>   desynced-dead, not idle-empty, so the stage-2 watchdog is blind AND dies with the
+>   thread it rides). Stage 3b intercepts that give-up: force-sync ZCULL (unpark the
+>   polling SPUs; composes with the driver's query-survive) and run RPCS3's existing
+>   queue-reset recovery instead of throwing, bounded to N consecutive give-ups; only on
+>   true exhaustion does it stop cleanly (ledger row, no R3). Never touches the config
+>   `as_ps3` accurate-death path. Default-off.
+> - `patches/etk-rpcs3-gtk-edition-0.6.1-dev-ffs-v3.patch` — prior dev cumulative
 >   (14 files / ~548 insertions): ffs-v2 **plus** anti-lock stage 2, the RSX progress
 >   watchdog (`GTK_RSX_WATCHDOG=1`, threshold `GTK_RSX_WATCHDOG_S` default 10 s): after a
 >   kernel hang-rescue drops a guest-visible completion, the game can park polling for it
