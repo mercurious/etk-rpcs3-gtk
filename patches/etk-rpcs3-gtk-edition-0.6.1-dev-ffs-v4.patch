@@ -258,8 +258,55 @@ index 86779c085..d7f7f5d6f 100644
  	cfg::uint<0, 1000000> lpadsquircling{ this, "Left Pad Squircling Factor", 4000 };
  	cfg::uint<0, 1000000> rpadsquircling{ this, "Right Pad Squircling Factor", 4000 };
  
+diff --git a/rpcs3/Emu/RSX/RSXTexture.cpp b/rpcs3/Emu/RSX/RSXTexture.cpp
+index 0d18cf0cd..3b840d048 100644
+--- a/rpcs3/Emu/RSX/RSXTexture.cpp
++++ b/rpcs3/Emu/RSX/RSXTexture.cpp
+@@ -243,6 +243,42 @@ namespace rsx
+ 	rsx::texture_channel_remap_t fragment_texture::decoded_remap() const
+ 	{
+ 		u32 remap_ctl = registers[NV4097_SET_TEXTURE_CONTROL1 + (m_index * 8)];
++
++		// ETK GTK experiment (11912 road-flicker, dossier Tier0_11912_ShadowRemapLocalization_20260702):
++		// GT5P parks its shadow-map TIU on a 1x1 fallback with a fully zeroed CONTROL1 (= FORCE-ZERO x4
++		// per the GCM enum) -> every track draw samples a constant-0 shadow-visibility term and the
++		// whole track renders shadowed; real hardware evidently treats the parked state as neutral.
++		// v2 (2026-07-02, after on-rig A/B): scoped to the exact confirmed signature — fully zeroed
++		// low word AND a 1x1 texture (on-rig probe showed the 1x1 is the ONLY zero-remap texture in
++		// live GT5P). Two decodes discriminate what console "neutral" means:
++		//   ONE x4            -> content-independent "no shadow" (kills content-staleness blips
++		//                        if the 1x1's texel is meaningless on console)
++		//   identity crossbar -> samples the 1x1's live content (correct if the game legitimately
++		//                        animates it as a global dimmer, e.g. tunnels)
++		// v1's blanket zero-control-field override caused short new flicker blips and is retired.
++		// v3 (0.6.0 GA): the ONE decode is ON BY DEFAULT — it is the hardware-matching
++		// interpretation (field-validated flicker-free, Eiger/Daytona) and the old opt-in gate
++		// was a leftover of the A/B bench, not a decision. Runtime controls:
++		//   GTK_REMAP0_ONE=0      -> kill-switch: stock zero-decode (diagnosis/regression A/B)
++		//   GTK_REMAP0_IDENTITY=1 -> identity-crossbar A/B variant
++		//   GTK_REMAP0_ONE=1      -> explicit ONE; outranks IDENTITY (preserves the v2 contract)
++		static const char* const s_gtk_remap0_env = std::getenv("GTK_REMAP0_ONE");
++		static const bool g_gtk_remap0_one_explicit = s_gtk_remap0_env && *s_gtk_remap0_env == '1';
++		static const bool g_gtk_remap0_off = s_gtk_remap0_env && *s_gtk_remap0_env == '0';
++		static const bool g_gtk_remap0_identity = []() { const char* e = std::getenv("GTK_REMAP0_IDENTITY"); return e && *e == '1'; }();
++		const bool gtk_use_identity = g_gtk_remap0_identity && !g_gtk_remap0_one_explicit;
++		if ((!g_gtk_remap0_off || g_gtk_remap0_identity) && (remap_ctl & 0xFFFF) == 0
++			&& width() <= 1 && height() <= 1) [[unlikely]]
++		{
++			static atomic_t<bool> s_logged = false;
++			if (!s_logged.exchange(true))
++			{
++				rsx_log.warning("GTK-REMAP0: %s override engaged (TIU%u raw=0x%08x)",
++					gtk_use_identity ? "identity" : "force-ONE", m_index, remap_ctl);
++			}
++			remap_ctl = (remap_ctl & 0xFFFF0000u) | (gtk_use_identity ? 0xAAE4u : 0x55E4u);
++		}
++
+ 		u32 remap_override = (remap_ctl >> 16) & 0xFFFF;
+ 
+ 		switch (format() & ~(CELL_GCM_TEXTURE_LN | CELL_GCM_TEXTURE_UN))
 diff --git a/rpcs3/Emu/RSX/RSXThread.cpp b/rpcs3/Emu/RSX/RSXThread.cpp
-index a2435dcff..8c1989141 100644
+index a2435dcff..788255d0d 100644
 --- a/rpcs3/Emu/RSX/RSXThread.cpp
 +++ b/rpcs3/Emu/RSX/RSXThread.cpp
 @@ -21,6 +21,8 @@
@@ -426,7 +473,47 @@ index a2435dcff..8c1989141 100644
  			}
  
  			// Execute FIFO queue
-@@ -2791,7 +2927,16 @@ namespace rsx
+@@ -2234,6 +2370,39 @@ namespace rsx
+ 			auto &tex = m_ctx->register_state->fragment_textures[i];
+ 			current_fp_texture_state.clear(i);
+ 
++			// ETK GTK probe (11912 road-flicker): transition-gated TIU state log, enabled via
++			// GTK_PROBE_11912=1. The dim<->lit flip signature is the shadow-map TIU swapping
++			// depth<->color class with a zeroed CONTROL1 remap-control field
++			// (dossier Tier0_11912_ShadowRemapLocalization_20260702).
++			static const bool g_gtk_probe_11912 = []() { const char* e = std::getenv("GTK_PROBE_11912"); return e && *e == '1'; }();
++			if (g_gtk_probe_11912) [[unlikely]]
++			{
++				static u32 s_last_remap[16] = {};
++				static u32 s_last_state[16] = {};
++				static u32 s_last_texel[16] = {};
++				const u32 raw_remap = tex.remap();
++				const u32 state = (static_cast<u32>(sampler_descriptors[i]->format_class) << 1) | (tex.enabled() ? 1u : 0u);
++				// v2: for the parked-shadow 1x1 (zero remap), also watch the guest texel's
++				// live CONTENT — discriminates game-animated dimmer vs stale cache vs static.
++				u32 texel = 0;
++				if (raw_remap == 0 && tex.width() <= 1 && tex.height() <= 1)
++				{
++					if (const u32 texaddr = get_address(tex.offset(), tex.location(), 4))
++					{
++						texel = vm::_ref<const u32>(texaddr);
++					}
++				}
++				if (s_last_remap[i] != raw_remap || s_last_state[i] != state || s_last_texel[i] != texel)
++				{
++					rsx_log.warning("GTK-PROBE-11912 TIU%u: remap=0x%08x class=%u enabled=%u dims=%ux%u zfunc=%u fmt=0x%x texel=0x%08x",
++						i, raw_remap, static_cast<u32>(sampler_descriptors[i]->format_class), tex.enabled() ? 1u : 0u,
++						tex.width(), tex.height(), static_cast<u32>(tex.zfunc()), static_cast<u32>(tex.format()), texel);
++					s_last_remap[i] = raw_remap;
++					s_last_state[i] = state;
++					s_last_texel[i] = texel;
++				}
++			}
++
+ 			if (!tex.enabled() || sampler_descriptors[i]->format_class == RSX_FORMAT_CLASS_UNDEFINED)
+ 			{
+ 				continue;
+@@ -2791,7 +2960,16 @@ namespace rsx
  
  	void thread::recover_fifo(std::source_location src_loc)
  	{
@@ -444,7 +531,7 @@ index a2435dcff..8c1989141 100644
  
  		const u64 current_time = get_system_time();
  
-@@ -2804,13 +2949,52 @@ namespace rsx
+@@ -2804,13 +2982,52 @@ namespace rsx
  			if (current_time - cmd_info.timestamp < 2'000'000u - std::min<u32>(g_cfg.video.driver_wakeup_delay * 700, 1'400'000))
  			{
  				// Probably hopeless

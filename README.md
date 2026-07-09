@@ -32,7 +32,7 @@ through mainline RPCS3 and this channel is no longer the recommended path for it
 >   (14 files / ~388 insertions): everything in 0.6.0 **plus** the tguard device-loss
 >   crash-net (v1–v6), trigger top-end calibration, and the audio timeline logger.
 > - `patches/etk-rpcs3-gtk-edition-0.6.1-dev-ffs-v4.patch` — **current** dev cumulative
->   (15 files / ~649 insertions): ffs-v3 **plus** anti-lock stage 3b, the FIFO-desync
+>   (16 files / ~718 insertions): ffs-v3 **plus** anti-lock stage 3b, the FIFO-desync
 >   resync net (`GTK_FIFO_RESYNC=1`, budget `GTK_FIFO_RESYNC_TRIES` default 10). A burst
 >   of kernel hang-rescues drops many submits' guest-visible effects; the resulting RSX
 >   command-FIFO desync *storm* trips RPCS3's own "hopeless" give-up in `recover_fifo()`
@@ -45,6 +45,13 @@ through mainline RPCS3 and this channel is no longer the recommended path for it
 >   queue-reset recovery instead of throwing, bounded to N consecutive give-ups; only on
 >   true exhaustion does it stop cleanly (ledger row, no R3). Never touches the config
 >   `as_ps3` accurate-death path. Default-off.
+>   **Corrected 2026-07-09:** this file was published missing `RSXTexture.cpp` entirely —
+>   the #11912 road-flicker fix (present in `0.6.0` and `tguard-v6`) had been dropped
+>   silently when the ffs series was generated. Restored by diffing the correct `tguard-v6`
+>   tree against the as-published `ffs-v4` tree and reconstructing the merge (verified: the
+>   flicker fix's insertion point in `RSXThread.cpp` doesn't overlap any ffs-specific hunk).
+>   The `v0.7.0` ETK release binary already had both fixes correctly combined — only this
+>   *published patch file* was out of sync with what was actually shipped.
 > - `patches/etk-rpcs3-gtk-edition-0.6.1-dev-ffs-v3.patch` — prior dev cumulative
 >   (14 files / ~548 insertions): ffs-v2 **plus** anti-lock stage 2, the RSX progress
 >   watchdog (`GTK_RSX_WATCHDOG=1`, threshold `GTK_RSX_WATCHDOG_S` default 10 s): after a
