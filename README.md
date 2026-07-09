@@ -7,9 +7,17 @@ workloads. It is the emulator half of the **[ETK](https://github.com/mercurious/
 Tuning Kit) stack; the driver half is **[etk-turnip-gtk](https://github.com/mercurious/etk-turnip-gtk)**.
 
 This repository exists to **publish the source and reproduce the build** — it is a development
-and tuning record. The ready-built AppImage ships as an asset of the matching
+and tuning record. The ROCKNIX AppImage ships as an asset of the matching
 [ETK release](https://github.com/mercurious/etk/releases) for use with the kit; everything needed
 to build the identical binary yourself is in [`BUILDING.md`](BUILDING.md).
+
+**macOS build available** — a native Apple Silicon / MoltenVK build, distributed directly from
+this repo's [Releases](../../releases) as a ready-to-run `.app` (unlike the ROCKNIX AppImage,
+which ships via the main ETK release). Useful as a rig-free field-test harness and as its own
+cross-platform validation of the road-flicker fix — see [`BUILDING.md`](BUILDING.md#target-macos--apple-silicon)
+to build it yourself. This is a **stopgap distribution channel** pending the upstream RPCS3 PR for
+[#11912](https://github.com/RPCS3/rpcs3/issues/11912); once that lands, the fix reaches everyone
+through mainline RPCS3 and this channel is no longer the recommended path for it.
 
 ---
 
@@ -82,7 +90,10 @@ source-tree fork: the delta is small, reviewable in one sitting, and applies cle
 ## Validation status (honest, per patch)
 
 - **#11912 remap fix** — field-validated: Eiger and Daytona 100% flicker-clean over multiple
-  sessions, with a small perf gain; the flicker had been open upstream for 5 years.
+  sessions, with a small perf gain; the flicker had been open upstream for 5 years. Independently
+  re-confirmed clean across Eiger, Daytona, HSL, and Fuji on **macOS / Apple M1 via MoltenVK**
+  (2026-07-09) — a different Vulkan implementation and silicon vendor from the ROCKNIX/Adreno
+  result, and about as strong a "this isn't a driver quirk" signal as this project can offer.
 - **Bounded fence waits** — deployed and swap-tested; the target a6xx wedge class has so far
   presented via a *different* spin site (occlusion-query wait), so these timeouts have not yet
   converted a real hang. Carried as harm-free hardening while the correct site is chased.
