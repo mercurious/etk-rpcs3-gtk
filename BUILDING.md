@@ -197,3 +197,105 @@ To confirm the fix is engaged, watch `~/Library/Caches/rpcs3/RPCS3.log` while pl
 `GTK-REMAP0: force-ONE override engaged (TIU...)` — this line fires with **no env vars set**, since
 the fix is on by default. Field-validated 2026-07-09: GT5P road-flicker gone across Eiger, Daytona,
 HSL, and Fuji on Apple M1 via MoltenVK.
+
+---
+
+# Target: Windows x64 (MSVC)
+
+A native Windows build against AMD's Vulkan driver — the **third** GPU vendor and third Vulkan
+implementation to confirm the road-flicker fix (after Adreno 650/Turnip and Apple M1/MoltenVK).
+Scoped to the **0.6.0** patch, same reasoning as macOS: the 0.6.1-dev tguard/ffs device-loss
+hardening targets a6xx/Adreno kernel-hang recovery and doesn't apply here.
+
+Validated 2026-07-09 on a Ryzen 9 6900HX (Radeon RDNA2 iGPU), AMD Vulkan driver 2.0.353.
+
+## 1. Toolchain (one-time)
+
+- **Visual Studio 2022 Build Tools** — "Desktop development with C++" (MSVC v143 + Windows SDK).
+- **CMake ≥ 3.28** (the Android SDK's 3.22 is too old). A portable Kitware zip is fine.
+- **Python 3** on PATH (LLVM's build scripts need it).
+- **Vulkan SDK 1.4.341.1** (LunarG). **Not optional** — see Trap 1.
+- **Qt 6.11.1** for `msvc2022_64`, with `qtmultimedia`. See Trap 2.
+
+## 2. Source + patch
+
+```bat
+git clone --recurse-submodules https://github.com/RPCS3/rpcs3 && cd rpcs3
+git checkout 60c9705a
+git submodule update --init --recursive --depth 1
+git apply \path\to\patches\etk-rpcs3-gtk-edition-0.6.0.patch
+```
+
+## 3. Configure + build
+
+Run from **PowerShell**, not Git Bash — see Trap 3.
+
+```powershell
+$env:Qt6_ROOT   = "C:\path\to\Qt\6.11.1\msvc2022_64"   # or your Qt prefix
+$env:VULKAN_SDK = "C:\VulkanSDK\1.4.341.1"
+
+cmake --preset msvc -DUSE_SYSTEM_SDL=OFF -DALSOFT_ENABLE_MODULES=OFF
+cmake --build --preset msvc-release
+```
+
+`USE_SYSTEM_SDL=OFF` builds the vendored static SDL3 (there is no system SDL3 on Windows).
+`ALSOFT_ENABLE_MODULES=OFF` disables openal-soft's C++20 named modules, which do not build under
+MSVC 17.14 (`could not find module 'gsl'` / `use of undefined type 'al::Context'`).
+
+The build compiles LLVM from source; budget ~40 min on 16 cores. Output: `build-msvc\bin\rpcs3.exe`.
+
+## 4. Traps (all four were hit; none are in RPCS3 or the patch)
+
+1. **The Vulkan SDK is mandatory.** RPCS3 does *not* vendor Vulkan-Headers. Without the SDK,
+   `find_package(Vulkan)` fails, the `3rdparty_vulkan` target is never created, the VK renderer is
+   compiled **out**, and you get a binary that only offers OpenGL. Configure prints the tell:
+   `USE_VULKAN was enabled, but libvulkan was not found. RPCS3 will be compiled without Vulkan support.`
+2. **Qt 6.11.x and `aqtinstall`.** `aqt` 3.3.0 cannot resolve the 6.11.x split-by-arch repo layout
+   (it builds a doubled `qt6_6111/qt6_6111/Updates.xml` path and 404s). Use the official Qt
+   installer, or fetch the archives directly from
+   `download.qt.io/online/qtsdkrepository/windows_x86/desktop/qt6_6111/qt6_6111_msvc2022_64/`.
+   After building, run `windeployqt rpcs3.exe` or it dies at startup with
+   *"no Qt platform could be initialized"*.
+3. **Configure from a shell without `awk` on PATH.** libpng does `find_program(AWK ...)`; if it finds
+   one (Git Bash ships `awk`), it takes its generate-`pnglibconf.h`-from-source path, whose
+   `pnglibconf.c` host-tool compile can't see `zlib.h` and fails with `C1083`. With no awk it uses
+   the shipped `scripts/pnglibconf.h.prebuilt` and everything works. PowerShell has no `awk`.
+4. **`libzlibstatic.a` link fixup.** The final `rpcs3.exe` link is handed a Unix-style
+   `..\3rdparty\zlib\zlib\libzlibstatic.a` (a redundant transitive reference; zlib is already linked
+   correctly as `zs.lib`). Reproduces on a clean build. Before the final link:
+
+   ```powershell
+   Copy-Item build-msvc\3rdparty\zlib\zlib\Release\zs.lib `
+             build-msvc\3rdparty\zlib\zlib\libzlibstatic.a -Force
+   cmake --build --preset msvc-release   # relinks
+   ```
+
+**Reliability note:** incremental reconfigures of `build-msvc` repeatedly broke on stale 3rdparty
+generated state (SDL3's package config, etc.). When you change a CMake option, **wipe `build-msvc`
+and configure clean.**
+
+## 5. Package
+
+```powershell
+mkdir dist
+Copy-Item build-msvc\bin\rpcs3.exe,build-msvc\bin\*.dll dist
+Copy-Item build-msvc\bin\GuiConfigs,build-msvc\bin\Icons,build-msvc\bin\translations dist -Recurse
+windeployqt --no-translations --release dist\rpcs3.exe   # platforms\, styles\, tls\, ...
+Compress-Archive dist\* rpcs3-gtk-edition-0.6.0_windows_x64.zip
+```
+
+## 6. Verify
+
+The binary self-reports the stock upstream version string, so identify by **sha256**:
+
+```
+rpcs3-gtk-edition-0.6.0_v0.0.41-19544-60c9705a_windows_x64.zip
+sha256 5abe1dbafc3091252a0fba8f3511033d04cc2ea35c67bb1f56f6b639e05ab6cb
+```
+
+To confirm the fix is engaged, watch `<exe dir>\log\RPCS3.log` while playing GT5P for
+`GTK-REMAP0: force-ONE override engaged (TIU...)` — this line fires with **no env vars set**, since
+the fix is on by default. Field-validated 2026-07-09: GT5P road stays lit at Daytona on
+AMD Radeon RDNA2 via AMD's native Vulkan driver, with
+`GTK-REMAP0: force-ONE override engaged (TIU15 raw=0x00000000)` in the log — the same parked-TIU
+signature seen on Adreno 650 (TIU15) and Apple M1 (TIU11).

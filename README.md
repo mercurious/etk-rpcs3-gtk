@@ -15,9 +15,35 @@ to build the identical binary yourself is in [`BUILDING.md`](BUILDING.md).
 this repo's [Releases](../../releases) as a ready-to-run `.app` (unlike the ROCKNIX AppImage,
 which ships via the main ETK release). Useful as a rig-free field-test harness and as its own
 cross-platform validation of the road-flicker fix — see [`BUILDING.md`](BUILDING.md#target-macos--apple-silicon)
-to build it yourself. This is a **stopgap distribution channel** pending the upstream RPCS3 PR for
+to build it yourself.
+
+**Windows x64 build available** — a native MSVC build against AMD's Vulkan driver, distributed from
+this repo's [Releases](../../releases) as a ready-to-run `.zip`. See
+[`BUILDING.md`](BUILDING.md#target-windows-x64-msvc) to build it yourself (four toolchain traps are
+documented there; none are in RPCS3 or the patch).
+
+Both desktop builds are a **stopgap distribution channel** pending the upstream RPCS3 PR for
 [#11912](https://github.com/RPCS3/rpcs3/issues/11912); once that lands, the fix reaches everyone
 through mainline RPCS3 and this channel is no longer the recommended path for it.
+
+## Road-flicker fix — cross-platform validation
+
+The same root-cause fix (`GTK_REMAP0_ONE`: decode a parked shadow-TIU's fully-zeroed `CONTROL1` as
+ONE×4 rather than FORCE-ZERO×4) is confirmed clean on **three distinct GPU vendors and three
+different Vulkan implementations** — about as strong a "this isn't a driver quirk" signal as the
+project can offer. On each, the fix's log line fires on the identical parked-TIU signature
+(`CONTROL1 raw = 0x00000000`, 1×1 texture):
+
+| Platform | GPU / API | Result |
+|---|---|---|
+| ROCKNIX (aarch64) | Adreno 650 / Turnip (native Vulkan) | road clean — Eiger, Daytona, HSL, Fuji |
+| macOS | Apple M1 / MoltenVK (Vulkan-over-Metal) | road clean — same tracks |
+| Windows x64 | AMD Radeon RDNA2 / AMD native Vulkan | road clean — Daytona, `TIU15 raw=0x00000000` |
+
+The fix has additionally been ported unchanged into two independently-maintained RPCS3-derived
+Android codebases ([aPS3e](https://github.com/mercurious/aps3e), RPCSX "Clanker"), both on the same
+Adreno 650 hardware — evidence the patch is *portable and correct across trees*, though not new
+hardware data points.
 
 ---
 
