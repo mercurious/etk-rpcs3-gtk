@@ -46,13 +46,37 @@ docker run --rm -v "$PWD":/rpcs3 -e COMPILER=clang \
 changed file(s) in and run `ninja` in `/rpcs3/build` (a one-file change is ~2 min instead of a
 full multi-hour build). Gate on ninja's real exit code; never pipe it to `tail`.
 
-## 4. Package the AppImage
+## 4. Package the AppImage — use the hardened packager, not the raw CI script
+
+**Drive `scripts/package-appimage.sh`, not `.ci/deploy-linux.sh` directly.** The stock CI
+script has four traps that shipped a broken v0.7.1 (game quit straight to ES with
+`AppRun.wrapped: error while loading shared libraries: libavcodec.so.62`):
+
+1. **Silent wrong-arch default** — it is `CPU_ARCH="${1:-x86_64}"`; forget the positional
+   `aarch64` on an arm64 host and it builds an x86_64-targeted package.
+2. **Stale pre-baked tools** — it only fetches `linuxdeploy`/`uruntime` behind a `[ ! -f ]`
+   guard, so a wrong-arch tool left in the image is silently reused.
+3. **Swallowed failures** — it continues past `linuxdeploy`/`uruntime` dying with
+   "Exec format error" and still exits 0 (an empty/no AppImage looks like success).
+4. **No verification** — a package can be produced whose binary can't find its own bundled
+   libs (linuxdeploy's RUNPATH-patch step is what makes ffmpeg et al resolve at
+   `$ORIGIN/../lib`; if it's skipped, the AppImage loads nothing on the rig).
+
+The packager follows the host arch, purges wrong-arch tools, gates on the real artifact, and
+**verifies by hiding the container's system ffmpeg and running the packaged AppImage `--version`**
+— it must still load (the rig's exact condition) or the script repairs the RUNPATH and repackages
+once, then fails loudly rather than shipping. `MARKER` asserts a symbol is actually in the binary
+(catches "packaged a stale build").
 
 ```sh
-docker run --rm -v "$PWD":/rpcs3 -e DEPLOY_APPIMAGE=true \
-    etk-rpcs3-jammy-aarch64:local sh -c \
-    'git config --global --add safe.directory "*"; rm -f /rpcs3/build/AppDir/.DirIcon; cd /rpcs3 && sh .ci/deploy-linux.sh aarch64'
+docker run --rm -v "$PWD":/rpcs3 -e MARKER=rpcs3_perf_stat \
+    etk-rpcs3-jammy-aarch64:local bash /rpcs3/scripts/package-appimage.sh aarch64
+# emits: produced / marker OK / VERIFY OK / sha256
 ```
+
+ROCKNIX (aarch64 AppImage) is the primary target; this is that lane's packager. The raw
+`.ci/deploy-linux.sh aarch64` still works **if driven exactly right** — but one forgotten arg or
+one stale tool ships a silently-broken binary, which is why the wrapper exists.
 
 Known packaging quirks (both benign, both hit in practice):
 - `deploy-linux.sh` re-runs fail on an existing `AppDir/.DirIcon` (its `ln -sr` has no `-f`) —
