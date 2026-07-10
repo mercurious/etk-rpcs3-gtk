@@ -1,0 +1,94 @@
+From: ETK GTK Edition <mercurious>
+Subject: [PATCH v0.7.1] perf-stat SHM emit — attribute a slow frame (PPU/SPU/RSX)
+
+The perf overlay already computes the per-subsystem frame split (PPU% / SPU% /
+RSX%) at Detail=High, but it only lives on-screen. This mirrors those SAME
+computed values to /dev/shm/rpcs3_perf_stat (+ a wall-clock rpcs3_perf_log
+timeline), exactly like the aud= emitter (ffs-v4), so the ETK ledger can
+attribute a pack-race bog to CPU-emulation vs GPU without the GUI.
+
+Design note (why emit the overlay's own values, not a standalone sampler): the
+cycle-delta accounting (thread_ctrl::get_cycles semantics) is subtle and lives in
+the build-vol Utilities tree, not verified here. Emitting m_ppu_usage/m_spu_usage/
+m_rsx_usage guarantees the SHM number == the number on screen — zero new math,
+zero divergence risk. Cost: only fires when the overlay runs at Detail=High
+(which the operator now toggles via the Pitstop Perf Overlay dials). A always-on
+standalone sampler is the v0.7.2 follow-up, once get_cycles() delta-vs-cumulative
+is confirmed against the build-vol source.
+
+Gated at Detail=High because that is the only level where the full record is
+fresh: high falls through to medium (sets ppu/spu/rsx) and itself sets frametime,
+rsx_load and thread count. At <high those extra fields are stale.
+
+Companion (separate, ETK repo): bin/session_postmortem.sh reads the SHM file into
+a trailing ledger column `perf`; config/pitstop_fields.json exposes the overlay
+
+--- a/rpcs3/Emu/RSX/Overlays/overlay_perf_metrics.cpp
++++ b/rpcs3/Emu/RSX/Overlays/overlay_perf_metrics.cpp	2026-07-10 12:52:24.355715449 +0000
+@@ -11,6 +11,48 @@
+ 
+ #include "util/cpu_stats.hpp"
+ 
++#include <cstdio>
++#include <ctime>
++
++namespace rsx
++{
++	namespace overlays
++	{
++		// ETK perf-stat SHM emit (v0.7.1, perfstat-v1). Mirror the overlay's OWN
++		// computed per-subsystem usage to /dev/shm so the ledger can attribute a
++		// slow frame (pack-bog: PPU/SPU/RSX split) with no GUI and no MangoHud.
++		// Same tmp+rename + bounded append-log pattern as the aud= emitter.
++		// fail-silent; Linux only (the rig). Values are exactly what the overlay
++		// draws, so ledger and screen can never disagree.
++		static void etk_perf_stats_dump(f32 fps, f32 ft_ms, f32 cpu,
++			f32 ppu, f32 spu, f32 rsx, u32 rsx_load, u32 threads)
++		{
++#ifdef __linux__
++			char line[256];
++			const int n = std::snprintf(line, sizeof(line),
++				"fps=%.1f ft_ms=%.2f cpu=%.1f ppu=%.1f spu=%.1f rsx=%.1f rsxload=%u thr=%u\n",
++				fps, ft_ms, cpu, ppu, spu, rsx, rsx_load, threads);
++			if (n <= 0) return;
++
++			if (std::FILE* f = std::fopen("/dev/shm/rpcs3_perf_stat.tmp", "w"))
++			{
++				std::fwrite(line, 1, static_cast<usz>(n), f);
++				std::fclose(f);
++				std::rename("/dev/shm/rpcs3_perf_stat.tmp", "/dev/shm/rpcs3_perf_stat");
++			}
++
++			if (std::FILE* tl = std::fopen("/dev/shm/rpcs3_perf_log", "a"))
++			{
++				std::fseek(tl, 0, SEEK_END);
++				if (std::ftell(tl) < 2 * 1024 * 1024)
++					std::fprintf(tl, "ep=%llu %s", static_cast<unsigned long long>(std::time(nullptr)), line);
++				std::fclose(tl);
++			}
++#endif
++		}
++	}
++}
++
+ namespace rsx
+ {
+ 	namespace overlays
+@@ -577,6 +619,17 @@
+ 					}
+ 				}
+ 
++				// ETK: mirror the just-computed frame split to SHM for the ledger.
++				// Detail=High is the only level where the full record is fresh
++				// (high -> medium fallthrough sets ppu/spu/rsx; high itself sets
++				// frametime/rsx_load/threads). Operator arms High via the Pitstop
++				// Perf Overlay dials for a pack/audio attribution stint.
++				if (m_detail == detail_level::high)
++				{
++					etk_perf_stats_dump(m_fps, m_frametime, m_cpu_usage,
++						m_ppu_usage, m_spu_usage, m_rsx_usage, m_rsx_load, m_total_threads);
++				}
++
+ 				// 2. Format output string
+ 				std::string perf_text;
+ 
