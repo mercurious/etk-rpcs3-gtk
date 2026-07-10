@@ -1,0 +1,40 @@
+rsx-zfunc-hwtest starting...
+shaders: fp 16 bytes, sampler unit 0, pos attr 0, texc attr 8
+display 1280x720 (scale 1.000,1.000)
+rsx-zfunc-hwtest cell map (fmt byte = 0x80|fmt):
+  A[0x0000][NEVER]   fmt=0x85 ctrl1=0x0000 zfunc=0 tex=1x1 rect=(140,72,84,84)
+  A[0x0000][GEQUAL]  fmt=0x85 ctrl1=0x0000 zfunc=6 tex=1x1 rect=(232,72,84,84)  <-- DECISIVE
+  A[0x0000][LEQUAL]  fmt=0x85 ctrl1=0x0000 zfunc=3 tex=1x1 rect=(324,72,84,84)
+  A[0x0000][ALWAYS]  fmt=0x85 ctrl1=0x0000 zfunc=7 tex=1x1 rect=(416,72,84,84)
+  A[0xAAE4][NEVER]   fmt=0x85 ctrl1=0xaae4 zfunc=0 tex=1x1 rect=(140,164,84,84)
+  A[0xAAE4][GEQUAL]  fmt=0x85 ctrl1=0xaae4 zfunc=6 tex=1x1 rect=(232,164,84,84)
+  A[0xAAE4][LEQUAL]  fmt=0x85 ctrl1=0xaae4 zfunc=3 tex=1x1 rect=(324,164,84,84)
+  A[0xAAE4][ALWAYS]  fmt=0x85 ctrl1=0xaae4 zfunc=7 tex=1x1 rect=(416,164,84,84)
+  A[0x55E4][NEVER]   fmt=0x85 ctrl1=0x55e4 zfunc=0 tex=1x1 rect=(140,256,84,84)
+  A[0x55E4][GEQUAL]  fmt=0x85 ctrl1=0x55e4 zfunc=6 tex=1x1 rect=(232,256,84,84)
+  A[0x55E4][LEQUAL]  fmt=0x85 ctrl1=0x55e4 zfunc=3 tex=1x1 rect=(324,256,84,84)
+  A[0x55E4][ALWAYS]  fmt=0x85 ctrl1=0x55e4 zfunc=7 tex=1x1 rect=(416,256,84,84)
+  B[0x0000][NEVER]   fmt=0x85 ctrl1=0x0000 zfunc=0 tex=1x1 rect=(140,388,84,84)
+  B[0x0000][GEQUAL]  fmt=0x85 ctrl1=0x0000 zfunc=6 tex=1x1 rect=(232,388,84,84)
+  B[0x0000][LEQUAL]  fmt=0x85 ctrl1=0x0000 zfunc=3 tex=1x1 rect=(324,388,84,84)
+  B[0x0000][ALWAYS]  fmt=0x85 ctrl1=0x0000 zfunc=7 tex=1x1 rect=(416,388,84,84)
+  B[0xAAE4][NEVER]   fmt=0x85 ctrl1=0xaae4 zfunc=0 tex=1x1 rect=(140,480,84,84)
+  B[0xAAE4][GEQUAL]  fmt=0x85 ctrl1=0xaae4 zfunc=6 tex=1x1 rect=(232,480,84,84)
+  B[0xAAE4][LEQUAL]  fmt=0x85 ctrl1=0xaae4 zfunc=3 tex=1x1 rect=(324,480,84,84)
+  B[0xAAE4][ALWAYS]  fmt=0x85 ctrl1=0xaae4 zfunc=7 tex=1x1 rect=(416,480,84,84)
+  B[0x55E4][NEVER]   fmt=0x85 ctrl1=0x55e4 zfunc=0 tex=1x1 rect=(140,572,84,84)
+  B[0x55E4][GEQUAL]  fmt=0x85 ctrl1=0x55e4 zfunc=6 tex=1x1 rect=(232,572,84,84)
+  B[0x55E4][LEQUAL]  fmt=0x85 ctrl1=0x55e4 zfunc=3 tex=1x1 rect=(324,572,84,84)
+  B[0x55E4][ALWAYS]  fmt=0x85 ctrl1=0x55e4 zfunc=7 tex=1x1 rect=(416,572,84,84)
+  C[DEPTH][LEQUAL]   fmt=0x90 ctrl1=0xaae4 zfunc=3 tex=1x1 rect=(700,72,84,84)
+  C[DEPTH][NEVER]    fmt=0x90 ctrl1=0xaae4 zfunc=0 tex=1x1 rect=(792,72,84,84)
+  SIZE[1x1]          fmt=0x85 ctrl1=0x0000 zfunc=6 tex=1x1 rect=(700,232,84,84)  <-- DECISIVE
+  SIZE[64x64]        fmt=0x85 ctrl1=0x0000 zfunc=6 tex=64x64 rect=(792,232,84,84)  <-- DECISIVE
+  REF[0.0]           fmt=0x85 ctrl1=0xaae4 zfunc=0 tex=1x1 rect=(700,412,84,84)
+  REF[0.5]           fmt=0x85 ctrl1=0xaae4 zfunc=0 tex=1x1 rect=(792,412,84,84)
+  REF[1.0]           fmt=0x85 ctrl1=0xaae4 zfunc=0 tex=1x1 rect=(884,412,84,84)
+dbgfont attribs: pos=0 texc=8 col=3 texunit=0
+dbgfont printPass: 224 verts, first pos -0.781 0.956
+dbgfont printPass: 180 verts, first pos -0.781 0.889
+dbgfont printPass: 20 verts, first pos -0.753 0.839
+framedump: wrote 1280x720 BMP

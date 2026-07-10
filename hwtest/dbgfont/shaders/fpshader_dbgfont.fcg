@@ -1,0 +1,13 @@
+void main(float4 color : COLOR0,
+		  float2 texcoord : TEXCOORD0,
+
+		  uniform sampler2D texture,
+
+		  out float4 oColor : COLOR0
+		 )
+{
+	// branch-free: glyph coverage lives in the texture alpha; let blending cut it out
+	float alpha = tex2D(texture, texcoord).w;
+	oColor.rgb = color.rgb;
+	oColor.a = color.a * alpha;
+}

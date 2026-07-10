@@ -1,0 +1,9 @@
+void main(float2 texcoord : TEXCOORD0,
+
+          uniform sampler2D sampler0,
+
+          out float4 oColor : COLOR0
+         )
+{
+    oColor = tex2D(sampler0, texcoord);
+}
