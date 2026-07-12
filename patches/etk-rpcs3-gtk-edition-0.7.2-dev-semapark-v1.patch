@@ -1,0 +1,268 @@
+From: ETK GTK Edition <mercurious>
+Subject: [PATCH v0.7.2] KERS stage 1 — SEMA PARK: escalate the NV406E semaphore
+ WFE spin to a timed futex park (+ sq/sw/pk counters in the perfstat line)
+
+Evidence (2026-07-12, SM8250 pack racing, three 30 s perf samples): the
+nv406e::semaphore_acquire wait loop is the hottest single symbol in the
+process at 10.7-11.8% of ALL cycles. The ARM64 spin primitive
+(spin_on_cacheline_once) is ldaxr+wfe and cannot honor its 100 us bound —
+wakes ride the kernel's ~107 us arch-timer event stream AND cacheline
+invalidations, and GCM labels are 16 bytes apart (FOUR guest labels per
+64 B monitored line; the flip label shares its line with labels 0/2/3), so
+neighbor-label traffic turns the wait into a hot spin of spurious wakes.
+
+Change: once a wait has burned GTK_SEMA_SPIN_US (default 150) without the
+semaphore changing, each further iteration takes a timed futex park of
+GTK_SEMA_PARK_US (default 200) via thread_ctrl::wait_on — a real kernel
+sleep — instead of another WFE lap. Releases are plain vm::write with no
+futex notify, so the park is timeout-bounded by construction; worst case
+adds one park period to an acquire already >150 us old (<=0.6% of a 33 ms
+frame). The FLIP semaphore (label_addr+0x10) is excluded: it is the
+wedge-prone path the anti-lock nets watch and keeps stock behavior. The
+full loop preamble (stop/pause/timeout + on_semaphore_acquire_wait — queued
+flips, flush requests) re-runs after every park.
+
+Default ON (house law: new-build features ship on); GTK_SEMA_PARK=0 is the
+A/B kill-switch restoring stock spin. Instrumentation is unconditional:
+cumulative counters (acquire-waits / wake-iterations / parks) are exported
+to the perfstat SHM line as per-interval deltas sq=/sw=/pk= — sw collapsing
+toward pk means the spin is parking; large sw with pk=0 means the
+kill-switch is active or the spin budget is never reached.
+
+Also bumps the self-ID to "GTK Edition v0.7.2".
+
+Base: v0.0.41-19544-60c9705a + 0.7.0 patch set + perfstat-v1.
+Design: ETK dossier KersConcept_20260712.md (S1/K1); validation program
+therein (dyno arms, N>=3 warm cells, lock%/wedge-rate regression = kill).
+
+--- a/rpcs3/Emu/RSX/NV47/HW/nv406e.cpp
++++ b/rpcs3/Emu/RSX/NV47/HW/nv406e.cpp
+@@ -3,13 +3,95 @@
+ #include "nv47_sync.hpp"
+ 
+ #include "Emu/RSX/RSXThread.h"
++#include "Utilities/Thread.h"
++#include "util/bless.hpp"
+ 
++#include <cstdlib>
++
+ #include "context_accessors.define.h"
+ 
+ namespace rsx
+ {
++	namespace etk
++	{
++		// ETK KERS stage 1 — SEMA PARK counters (semapark-v1, 2026-07-12).
++		// Cumulative; the perfstat emitter (overlay_perf_metrics.cpp) extern-
++		// declares these and appends per-interval deltas to the SHM line —
++		// same cross-TU linkage idiom as vk::is_device_lost. Plain atomics:
++		// never a reason to fail, never on the R3 path.
++		atomic_t<u64> g_sema_acquires{0}; // acquire calls that had to wait
++		atomic_t<u64> g_sema_wakes{0};    // wait-loop iterations (one per WFE wake / stream tick)
++		atomic_t<u64> g_sema_parks{0};    // timed futex parks taken
++	}
++
+ 	namespace nv406e
+ 	{
++		// ETK KERS stage 1 — SEMA PARK (semapark-v1, 2026-07-12; design:
++		// dossiers/KersConcept_20260712.md §3-K1).
++		//
++		// Evidence: on SM8250 pack racing this wait loop is the single
++		// hottest symbol in the process — 10.7-11.8% of ALL cycles across
++		// three 30 s perf samples (NPEA00502, 2026-07-12). The WFE inside
++		// spin_on_cacheline_once cannot honor its 100 µs bound on ARM (the
++		// comment in asm.hpp says so): wakes ride the kernel's ~107 µs
++		// arch-timer event stream AND cacheline invalidations — and GCM
++		// labels are 16 bytes apart, so FOUR guest labels share each 64 B
++		// monitored line. Six SPU threads hammering reservations turn the
++		// "wait" into a hot spin of spurious wakes.
++		//
++		// Mitigation: once the spin has burned GTK_SEMA_SPIN_US (default 150)
++		// without the semaphore changing, escalate each iteration to a timed
++		// futex park of GTK_SEMA_PARK_US (default 200) — a real kernel sleep.
++		// Releases are plain vm::write with no futex notify, so the park is
++		// timeout-bounded by construction; worst case it adds one park period
++		// to an acquire that was already >150 µs old (≤0.6% of a 33 ms frame).
++		// The FLIP semaphore (label_addr+0x10) is deliberately excluded: it is
++		// the wedge-prone path the anti-lock nets watch, and it must keep the
++		// tightest possible reaction time (KersConcept falsifier (b)).
++		// The full loop preamble (stop/pause/timeout checks and
++		// on_semaphore_acquire_wait — queued flips, flush requests) re-runs
++		// after every park, so pending local work is serviced at least once
++		// per park period.
++		//
++		// Default ON (house law: new-build features ship on, kill-switch for
++		// A/B): GTK_SEMA_PARK=0 disables, restoring stock WFE-spin behavior.
++		static bool etk_sema_park_enabled()
++		{
++			static const bool enabled = []()
++			{
++				const char* v = std::getenv("GTK_SEMA_PARK");
++				return !(v && *v == '0');
++			}();
++			return enabled;
++		}
++
++		static u64 etk_sema_spin_us()
++		{
++			static const u64 us = []() -> u64
++			{
++				if (const char* v = std::getenv("GTK_SEMA_SPIN_US"))
++				{
++					const u64 parsed = std::strtoull(v, nullptr, 10);
++					if (parsed >= 1 && parsed <= 1'000'000) return parsed;
++				}
++				return 150;
++			}();
++			return us;
++		}
++
++		static u64 etk_sema_park_us()
++		{
++			static const u64 us = []() -> u64
++			{
++				if (const char* v = std::getenv("GTK_SEMA_PARK_US"))
++				{
++					const u64 parsed = std::strtoull(v, nullptr, 10);
++					if (parsed >= 50 && parsed <= 10'000) return parsed;
++				}
++				return 200;
++			}();
++			return us;
++		}
+ 		void set_reference(context* ctx, u32 /*reg*/, u32 arg)
+ 		{
+ 			RSX(ctx)->sync();
+@@ -29,7 +111,7 @@
+ 			RSX(ctx)->m_graphics_state |= rsx::pipeline_state::fragment_program_needs_rehash;
+ 
+ 			const auto& sema = vm::_ref<RsxSemaphore>(addr);
+-			const auto& atomic_sema = vm::_ref<atomic_t<RsxSemaphore>>(addr);
++			const auto& atomic_sema = vm::_ref<atomic_t<RsxSemaphore>>(addr);
+ 
+ 			if (sema == arg)
+ 			{
+@@ -50,8 +132,15 @@
+ 			u64 start = get_system_time();
+ 			u64 last_check_val = start;
+ 
++			// ETK semapark-v1 (doc block above): flip semaphore keeps the
++			// stock spin; everything else may escalate to a timed park.
++			const bool sema_park_eligible = etk_sema_park_enabled() && (addr != RSX(ctx)->label_addr + 0x10);
++			etk::g_sema_acquires++;
++
+ 			while (sema != arg)
+ 			{
++				etk::g_sema_wakes++;
++
+ 				if (RSX(ctx)->test_stopped())
+ 				{
+ 					RSX(ctx)->state += cpu_flag::again;
+@@ -80,17 +169,31 @@
+ 					}
+ 				}
+ 
+-				if (RSX(ctx)->external_interrupt_lock ||
+-					(RSX(ctx)->state & (cpu_flag::dbg_global_pause + cpu_flag::exit)) == cpu_flag::dbg_global_pause)
+-				{
+-					RSX(ctx)->cpu_wait({});
+-					continue;
+-				}
+-
+-				RSX(ctx)->on_semaphore_acquire_wait();
+-
+-				// Wait until the value changes or until 100us pass.
+-				utils::spin_on_cacheline_once(atomic_sema, sema, 100);
++				if (RSX(ctx)->external_interrupt_lock ||
++					(RSX(ctx)->state & (cpu_flag::dbg_global_pause + cpu_flag::exit)) == cpu_flag::dbg_global_pause)
++				{
++					RSX(ctx)->cpu_wait({});
++					continue;
++				}
++
++				RSX(ctx)->on_semaphore_acquire_wait();
++
++				// ETK semapark-v1: past the spin budget, take a real kernel
++				// sleep instead of another lap of spurious WFE wakes. The
++				// futex old-value is the word's live bits (any change is a
++				// reason to re-check); nobody notifies this address, so the
++				// park returns at timeout (or on thread sync/task signals,
++				// which wait_on also arms) and the loop re-runs the preamble.
++				if (sema_park_eligible && (get_system_time() - start) >= etk_sema_spin_us())
++				{
++					etk::g_sema_parks++;
++					auto* wait_word = utils::bless<atomic_t<u32>>(&const_cast<atomic_t<RsxSemaphore>&>(atomic_sema));
++					thread_ctrl::wait_on(*wait_word, wait_word->load(), etk_sema_park_us());
++					continue;
++				}
++
++				// Wait until the value changes or until 100us pass.
++				utils::spin_on_cacheline_once(atomic_sema, sema, 100);
+ 			}
+ 
+ 			RSX(ctx)->fifo_wake_delay();
+--- a/rpcs3/Emu/RSX/Overlays/overlay_perf_metrics.cpp
++++ b/rpcs3/Emu/RSX/Overlays/overlay_perf_metrics.cpp
+@@ -14,8 +14,21 @@
+ #include <cstdio>
+ #include <ctime>
+ 
++// ETK semapark-v1 counters (Emu/RSX/NV47/HW/nv406e.cpp). Forward-declared to
++// keep RSX HW headers out of the overlay TU; linked from the same binary —
++// the vk::is_device_lost idiom.
+ namespace rsx
+ {
++	namespace etk
++	{
++		extern atomic_t<u64> g_sema_acquires;
++		extern atomic_t<u64> g_sema_wakes;
++		extern atomic_t<u64> g_sema_parks;
++	}
++}
++
++namespace rsx
++{
+ 	namespace overlays
+ 	{
+ 		// ETK perf-stat SHM emit (v0.7.1, perfstat-v1). Mirror the overlay's OWN
+@@ -24,14 +37,26 @@
+ 		// Same tmp+rename + bounded append-log pattern as the aud= emitter.
+ 		// fail-silent; Linux only (the rig). Values are exactly what the overlay
+ 		// draws, so ledger and screen can never disagree.
++		// semapark-v1 addendum: sq/sw/pk = SEMA PARK deltas since the previous
++		// emit (acquire-waits entered / wake iterations / futex parks) — the
++		// K1 instrument. sw collapsing toward pk = the spin is parking; a huge
++		// sw with pk=0 = kill-switch active or spin budget never reached.
+ 		static void etk_perf_stats_dump(f32 fps, f32 ft_ms, f32 cpu,
+ 			f32 ppu, f32 spu, f32 rsx, u32 rsx_load, u32 threads)
+ 		{
+ #ifdef __linux__
+-			char line[256];
++			static u64 prev_sq = 0, prev_sw = 0, prev_pk = 0;
++			const u64 cur_sq = etk::g_sema_acquires.load();
++			const u64 cur_sw = etk::g_sema_wakes.load();
++			const u64 cur_pk = etk::g_sema_parks.load();
++			const u64 d_sq = cur_sq - prev_sq, d_sw = cur_sw - prev_sw, d_pk = cur_pk - prev_pk;
++			prev_sq = cur_sq; prev_sw = cur_sw; prev_pk = cur_pk;
++
++			char line[320];
+ 			const int n = std::snprintf(line, sizeof(line),
+-				"fps=%.1f ft_ms=%.2f cpu=%.1f ppu=%.1f spu=%.1f rsx=%.1f rsxload=%u thr=%u\n",
+-				fps, ft_ms, cpu, ppu, spu, rsx, rsx_load, threads);
++				"fps=%.1f ft_ms=%.2f cpu=%.1f ppu=%.1f spu=%.1f rsx=%.1f rsxload=%u thr=%u sq=%llu sw=%llu pk=%llu\n",
++				fps, ft_ms, cpu, ppu, spu, rsx, rsx_load, threads,
++				static_cast<unsigned long long>(d_sq), static_cast<unsigned long long>(d_sw), static_cast<unsigned long long>(d_pk));
+ 			if (n <= 0) return;
+ 
+ 			if (std::FILE* f = std::fopen("/dev/shm/rpcs3_perf_stat.tmp", "w"))
+--- a/rpcs3/rpcs3_version.cpp
++++ b/rpcs3/rpcs3_version.cpp
+@@ -50,7 +50,7 @@
+ 	std::string get_verbose_version()
+ 	{
+ 		std::string version = fmt::format("%s | %s", rpcs3::get_version().to_string(), get_branch());
+-		fmt::append(version, " | GTK Edition v0.7.0");
++		fmt::append(version, " | GTK Edition v0.7.2");
+ 		if (is_local_build())
+ 		{
+ 			fmt::append(version, " | local_build");
