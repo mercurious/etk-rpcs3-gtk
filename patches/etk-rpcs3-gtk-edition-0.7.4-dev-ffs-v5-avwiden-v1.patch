@@ -1,0 +1,359 @@
+From: ETK GTK Edition <mercurious>
+Subject: [PATCH v0.7.4] anti-lock stage 4 (ffs-v5, flip-status force-retire)
+ + avwiden-v1 (access-violation readahead invalidation)
+
+Two nets in one build, both operator-cleared 2026-07-12.
+
+FFS-V5 — flip-status force-retire (anti-lock stage 4). The remaining ~50%
+RECOVERY share on 00E59005 (N>=6 in one weekend): a keepalive rescue drops
+the submit whose completion would have flipped; flip_status stays WAITING
+forever and the guest parks in its cellGcmGetFlipStatus poll (GT5P EMAIN
+0xbc92d0, ps3probe flip lens). The retire runs on the rsx thread inside the
+stage-2 watchdog cadence and replays handle_emu_flip's completion tail
+(flip_status -> DONE + flip-handler interrupt). Gated on a rescue having
+occurred inside the WAITING window (forced-fence delta / stage-2 arming /
+FIFO-desync streak) so organic long waits are never touched. Default ON;
+GTK_FLIP_RETIRE=0 kill-switch; GTK_FLIP_RETIRE_S threshold (3 s default);
+GTK_FLIP_RETIRE_ANY=1 drops the rescue gate (diagnostic).
+
+AVWIDEN-V1 — access-violation readahead. GT HD at LOCKED-60 burns
+13.3/20.5/14.8% of ALL cycles (three bog samples) in on_access_violation:
+one PPU thread streaming writes through protected pages, one fault per 4K
+page, every frame. On a WRITE fault the handler now additionally
+invalidates a readahead span AHEAD of the faulting page (default 65536 =
+16 pages) so a linear writer takes one fault per span. The faulting page
+keeps the stock single-address call (exact violation_handled semantics —
+a neighbor-only hit must never claim the fault page as handled); the
+readahead result is deliberately dropped, which is safe by construction:
+deferred-cause flushables are returned untouched (they heal via their own
+later fault) and dirtied non-flushables refault at most once. Read faults
+stay precise. Default ON; GTK_AV_READAHEAD=0 kill-switch or byte count
+(4K..16M, page-rounded).
+
+Instrumentation: perfstat line gains av= (fault delta per interval) and
+fr= (cumulative flip retires); new forced-fence accessor
+vk::etk_fence_forced_count().
+
+Self-IDs "GTK Edition v0.7.4".
+Base: v0.0.41-19544-60c9705a + 0.7.0 set + perfstat-v1 + semapark-v2.
+Design: ETK dossiers KersConcept_20260712.md (access-violation = the
+GT HD KPI lever) + SessionHandoff_20260710_DynoAttribution.md (ffs-v5).
+
+--- a/rpcs3/Emu/RSX/RSXThread.cpp
++++ b/rpcs3/Emu/RSX/RSXThread.cpp
+@@ -115,6 +115,13 @@
+ 	}
+ 
+ 	return true;
++}
++
++// ffs-v5: forced-fence counter accessor (vkutils/sync.cpp). Forward-declared
++// to keep Vulkan headers out — the vk::is_device_lost linkage idiom.
++namespace vk
++{
++	u64 etk_fence_forced_count();
+ }
+ 
+ namespace rsx
+@@ -1019,6 +1026,64 @@
+ 			return 10u;
+ 		}();
+ 		return budget;
++	}
++
++	namespace etk
++	{
++		// ETK v0.7.4 counters (perfstat-surfaced; overlay_perf_metrics.cpp
++		// extern-declares them — the vk::is_device_lost linkage idiom).
++		atomic_t<u64> g_flip_retires{0};    // ffs-v5 forced flip retires
++		atomic_t<u64> g_av_write_faults{0}; // access-violation write faults (VKGSRender)
++		atomic_t<u64> g_av_read_faults{0};  // access-violation read faults
++	}
++
++	// ETK anti-lock stage 4 — flip-status force-retire (ffs-v5, 2026-07-12,
++	// GTK Edition v0.7.4). The remaining ~50% RECOVERY share on 00E59005
++	// (N>=6 in one weekend): a keepalive rescue drops the submit whose
++	// completion would have flipped; flip_status stays WAITING forever and
++	// the guest parks in its cellGcmGetFlipStatus poll (GT5P EMAIN 0xbc92d0,
++	// lifted by ps3probe's flip lens). Nothing below can help — the fence
++	// force-signal nets operate at the Vulkan layer, but the guest-visible
++	// LOSS already happened. The retire runs on the rsx thread (the same
++	// thread handle_emu_flip runs on) and replays exactly its completion
++	// tail: flip_status -> DONE + fire the registered flip handler. Gated on
++	// a rescue having occurred inside the WAITING window (forced-fence count
++	// delta, stage-2 arming, or a FIFO-desync streak) so an organic long
++	// wait (loading screen) is never touched; GTK_FLIP_RETIRE_ANY=1 drops
++	// the gate for diagnosis. Default ON (house law), GTK_FLIP_RETIRE=0
++	// kill-switch, threshold GTK_FLIP_RETIRE_S (default 3 s).
++	static bool etk_flip_retire_enabled()
++	{
++		static const bool enabled = []()
++		{
++			const char* v = std::getenv("GTK_FLIP_RETIRE");
++			return !(v && *v == '0');
++		}();
++		return enabled;
++	}
++
++	static u64 etk_flip_retire_threshold_us()
++	{
++		static const u64 us = []() -> u64
++		{
++			if (const char* v = std::getenv("GTK_FLIP_RETIRE_S"))
++			{
++				const u64 parsed = std::strtoull(v, nullptr, 10);
++				if (parsed >= 1 && parsed <= 120) return parsed * 1'000'000;
++			}
++			return 3'000'000;
++		}();
++		return us;
++	}
++
++	static bool etk_flip_retire_any()
++	{
++		static const bool any = []()
++		{
++			const char* v = std::getenv("GTK_FLIP_RETIRE_ANY");
++			return v && *v == '1';
++		}();
++		return any;
+ 	}
+ 
+ 	void thread::on_task()
+@@ -1219,6 +1284,11 @@
+ 		// 0 = armed, 1 = stage A fired (zcull force-sync done), 2 = gave up.
+ 		u32 etk_wd_stage = 0;
+ 
++		// ETK anti-lock stage 4 state (ffs-v5): the continuous flip-WAITING
++		// window and the rescue-counter snapshot taken when it opened.
++		u64 etk_flip_wait_mark = 0;
++		u64 etk_fence_forced_at_mark = 0;
++
+ 		while (!test_stopped())
+ 		{
+ 			// Wait for external pause events
+@@ -1292,6 +1362,66 @@
+ 						}
+ 					}
+ 				}
++
++				// ETK anti-lock stage 4 — flip-status force-retire (ffs-v5;
++				// doc block above the flag getters). Two compares per 64
++				// cycles when healthy.
++				if (etk_flip_retire_enabled() && int_flip_index > 0 && !Emu.IsPaused())
++				{
++					if (flip_status != CELL_GCM_DISPLAY_FLIP_STATUS_WAITING)
++					{
++						etk_flip_wait_mark = 0;
++					}
++					else if (!etk_flip_wait_mark)
++					{
++						etk_flip_wait_mark = get_system_time();
++						etk_fence_forced_at_mark = vk::etk_fence_forced_count();
++					}
++					else if (get_system_time() - etk_flip_wait_mark > etk_flip_retire_threshold_us())
++					{
++						const bool rescued = vk::etk_fence_forced_count() != etk_fence_forced_at_mark
++							|| etk_wd_stage != 0 || etk_fifo_dead_streak != 0;
++
++						if (rescued || etk_flip_retire_any())
++						{
++							const u64 n = ++etk::g_flip_retires;
++							rsx_log.error("ETK anti-lock stage4 (ffs-v5): guest flip WAITING %llums across a rescue - force-retiring flip status (retire #%llu, flip#%llu, forced_fences=%llu).",
++								(get_system_time() - etk_flip_wait_mark) / 1000, n, int_flip_index, vk::etk_fence_forced_count());
++
++							// Replay handle_emu_flip's completion tail: the
++							// status write the guest polls, then its flip
++							// handler interrupt. Same thread, same order.
++							flip_status = CELL_GCM_DISPLAY_FLIP_STATUS_DONE;
++
++							if (!isHLE)
++							{
++								sys_rsx_context_attribute(0x55555555, 0xFEC, current_display_buffer, 0, 0, 0);
++							}
++							else if (auto ptr = flip_handler)
++							{
++								intr_thread->cmd_list
++								({
++									{ ppu_cmd::set_args, 1 }, u64{ 1 },
++									{ ppu_cmd::lle_call, ptr },
++									{ ppu_cmd::sleep, 0 }
++								});
++
++								intr_thread->cmd_notify.store(1);
++								intr_thread->cmd_notify.notify_one();
++							}
++
++							etk_flip_wait_mark = 0;
++						}
++						else
++						{
++							// No rescue inside the window — an organic long
++							// wait (loading screen). Re-anchor so a LATER
++							// rescue is measured against a fresh window.
++							etk_flip_wait_mark = get_system_time();
++							etk_fence_forced_at_mark = vk::etk_fence_forced_count();
++						}
++					}
++				}
+ 			}
+ 
+ 			// Execute FIFO queue
+--- a/rpcs3/Emu/RSX/VK/VKGSRender.cpp
++++ b/rpcs3/Emu/RSX/VK/VKGSRender.cpp
+@@ -892,6 +892,49 @@
+ #endif
+ }
+ 
++// ETK avwiden-v1 counters (defined in RSXThread.cpp namespace rsx::etk;
++// surfaced on the perfstat line by overlay_perf_metrics.cpp).
++namespace rsx
++{
++	namespace etk
++	{
++		extern atomic_t<u64> g_av_write_faults;
++		extern atomic_t<u64> g_av_read_faults;
++	}
++}
++
++// ETK avwiden-v1 (2026-07-12, GTK Edition v0.7.4). Evidence: GT HD at
++// LOCKED-60 burns 13.3 / 20.5 / 14.8% of ALL process cycles (three bog
++// samples, 2026-07-12) inside this handler — one PPU thread streaming
++// writes through texture-cache-protected pages, faulting page by page,
++// every frame. Mitigation: on a WRITE fault, additionally invalidate a
++// readahead span AHEAD of the faulting page so a linear writer takes one
++// fault per span instead of one per 4K page. Correctness: invalidation is
++// conservative by construction (worst case = extra texture revalidation);
++// the faulting page itself KEEPS the stock single-address call, preserving
++// exact violation_handled semantics (a widened-range hit on a neighbor
++// must never report the fault page as handled — that would refault
++// forever). Read faults stay precise (widening a read fault could flush
++// render targets wholesale). Default ON at 65536 (16 pages);
++// GTK_AV_READAHEAD=0 kill-switch, or a byte count (4K..16M, page-rounded).
++namespace
++{
++	u32 etk_av_readahead_bytes()
++	{
++		static const u32 bytes = []() -> u32
++		{
++			if (const char* v = std::getenv("GTK_AV_READAHEAD"))
++			{
++				const u64 parsed = std::strtoull(v, nullptr, 10);
++				if (parsed == 0) return 0;
++				if (parsed >= 4096 && parsed <= 16u * 1024 * 1024) return static_cast<u32>(parsed & ~0xfffull);
++			}
++			return 65536;
++		}();
++		return bytes;
++	}
++}
++
+ bool VKGSRender::on_access_violation(u32 address, bool is_writing)
+ {
+ 	rsx::mm_flush(address);
+@@ -899,7 +942,25 @@
+ 	vk::texture_cache::thrashed_set result;
+ 	{
+ 		const rsx::invalidation_cause cause = is_writing ? rsx::invalidation_cause::deferred_write : rsx::invalidation_cause::deferred_read;
++		(is_writing ? rsx::etk::g_av_write_faults : rsx::etk::g_av_read_faults)++;
+ 		result = m_texture_cache.invalidate_address(*m_secondary_cb_list.get(), address, cause);
++
++		// avwiden-v1 (doc block above): opportunistic readahead invalidation
++		// for the pages a linear writer will hit next. Result deliberately
++		// ignored — the stock call above owns violation_handled.
++		if (const u32 widen = etk_av_readahead_bytes(); widen && is_writing)
++		{
++			const u32 next_page = (address & ~0xfffu) + 0x1000;
++			if (next_page > address) // no wrap at the top of the address space
++			{
++				const u32 span = static_cast<u32>(std::min<u64>(widen, 0x1'0000'0000ull - next_page));
++				if (span)
++				{
++					m_texture_cache.invalidate_range(*m_secondary_cb_list.get(),
++						utils::address_range32::start_length(next_page, span), cause);
++				}
++			}
++		}
+ 	}
+ 
+ 	if (result.invalidate_samplers)
+--- a/rpcs3/Emu/RSX/VK/vkutils/sync.cpp
++++ b/rpcs3/Emu/RSX/VK/vkutils/sync.cpp
+@@ -612,6 +612,14 @@
+ 	}
+ 
+ 	static atomic_t<u64> g_etk_fence_forced_count = 0;
++
++	// ffs-v5 (v0.7.4): expose the forced-fence count so the RSX-side flip
++	// force-retire net can gate on "a rescue actually happened in this
++	// window" (RSXThread.cpp stage 4). Read-only, lock-free.
++	u64 etk_fence_forced_count()
++	{
++		return g_etk_fence_forced_count.load();
++	}
+ 
+ 	// Player-facing rescue notice (operator request 2026-07-05): the freeze is
+ 	// noticeable, so tell the driver to stay at the controls. Queued via
+--- a/rpcs3/Emu/RSX/VK/vkutils/sync.h
++++ b/rpcs3/Emu/RSX/VK/vkutils/sync.h
+@@ -58,6 +58,7 @@
+ 	bool etk_fence_force_enabled();
+ 	bool etk_fence_note_not_ready(fence* pfence);  // true => force-complete NOW
+ 	void etk_fence_note_signaled(fence* pfence);
++	u64 etk_fence_forced_count();                  // ffs-v5 rescue gate (RSXThread.cpp)
+ 
+ 	class event
+ 	{
+--- a/rpcs3/Emu/RSX/Overlays/overlay_perf_metrics.cpp
++++ b/rpcs3/Emu/RSX/Overlays/overlay_perf_metrics.cpp
+@@ -25,6 +25,11 @@
+ 		extern atomic_t<u64> g_sema_wakes;
+ 		extern atomic_t<u64> g_sema_parks;
+ 		extern atomic_t<u64> g_sema_parks_flip;
++		// v0.7.4 (RSXThread.cpp): access-violation fault counters + ffs-v5
++		// flip retires.
++		extern atomic_t<u64> g_av_write_faults;
++		extern atomic_t<u64> g_av_read_faults;
++		extern atomic_t<u64> g_flip_retires;
+ 	}
+ }
+ 
+@@ -46,20 +51,22 @@
+ 			f32 ppu, f32 spu, f32 rsx, u32 rsx_load, u32 threads)
+ 		{
+ #ifdef __linux__
+-			static u64 prev_sq = 0, prev_sw = 0, prev_pk = 0, prev_pf = 0;
++			static u64 prev_sq = 0, prev_sw = 0, prev_pk = 0, prev_pf = 0, prev_av = 0;
+ 			const u64 cur_sq = etk::g_sema_acquires.load();
+ 			const u64 cur_sw = etk::g_sema_wakes.load();
+ 			const u64 cur_pk = etk::g_sema_parks.load();
+ 			const u64 cur_pf = etk::g_sema_parks_flip.load();
+-			const u64 d_sq = cur_sq - prev_sq, d_sw = cur_sw - prev_sw, d_pk = cur_pk - prev_pk, d_pf = cur_pf - prev_pf;
+-			prev_sq = cur_sq; prev_sw = cur_sw; prev_pk = cur_pk; prev_pf = cur_pf;
++			const u64 cur_av = etk::g_av_write_faults.load() + etk::g_av_read_faults.load();
++			const u64 cur_fr = etk::g_flip_retires.load();
++			const u64 d_sq = cur_sq - prev_sq, d_sw = cur_sw - prev_sw, d_pk = cur_pk - prev_pk, d_pf = cur_pf - prev_pf, d_av = cur_av - prev_av;
++			prev_sq = cur_sq; prev_sw = cur_sw; prev_pk = cur_pk; prev_pf = cur_pf; prev_av = cur_av;
+ 
+ 			char line[352];
+ 			const int n = std::snprintf(line, sizeof(line),
+-				"fps=%.1f ft_ms=%.2f cpu=%.1f ppu=%.1f spu=%.1f rsx=%.1f rsxload=%u thr=%u sq=%llu sw=%llu pk=%llu pf=%llu\n",
++				"fps=%.1f ft_ms=%.2f cpu=%.1f ppu=%.1f spu=%.1f rsx=%.1f rsxload=%u thr=%u sq=%llu sw=%llu pk=%llu pf=%llu av=%llu fr=%llu\n",
+ 				fps, ft_ms, cpu, ppu, spu, rsx, rsx_load, threads,
+ 				static_cast<unsigned long long>(d_sq), static_cast<unsigned long long>(d_sw), static_cast<unsigned long long>(d_pk),
+-				static_cast<unsigned long long>(d_pf));
++				static_cast<unsigned long long>(d_pf), static_cast<unsigned long long>(d_av), static_cast<unsigned long long>(cur_fr));
+ 			if (n <= 0) return;
+ 
+ 			if (std::FILE* f = std::fopen("/dev/shm/rpcs3_perf_stat.tmp", "w"))
+--- a/rpcs3/rpcs3_version.cpp
++++ b/rpcs3/rpcs3_version.cpp
+@@ -50,7 +50,7 @@
+ 	std::string get_verbose_version()
+ 	{
+ 		std::string version = fmt::format("%s | %s", rpcs3::get_version().to_string(), get_branch());
+-		fmt::append(version, " | GTK Edition v0.7.3");
++		fmt::append(version, " | GTK Edition v0.7.4");
+ 		if (is_local_build())
+ 		{
+ 			fmt::append(version, " | local_build");
