@@ -107,18 +107,25 @@ sprxlinker-fixed one the Makefile produces under `build/`.
 
 See the header of [build.sh](build.sh) for the pinned toolchain image digest
 and the NVIDIA Cg toolkit note (cgcomp needs x86 `libCg.so`, fetched
-separately, never redistributed). Artifact hashes for this build:
+separately, never redistributed).
+
+**Reproducibility boundary:** the **ELF is bit-reproducible** — same source +
+pinned toolchain → identical ELF every build, so it's the meaningful
+verification anchor. The CEX `.self` (and the `.pkg`/`.gnpdrm.pkg` wrapping it)
+are re-signed by `make_self` with a fresh seed each run, so their hashes are
+**not** stable across builds; they identify the specific shipped copies below,
+not a reproducibility target. The `.fake.self` (fself) is deterministic.
 
 ```
-277f91644afb0c61396eff4e9cd9f771e9990c6e00d1df685952ab82cfe0fd85  rsx-zfunc-hwtest.elf
-b057c1dd9c7799ce88d4e6d1f09bad7542779f6d5c52b5a8b7067338805b068c  rsx-zfunc-hwtest.self
-83a238fe4d066f74bc48cd3cc51c17bff783df09ea8d16258854cd2219e517d9  rsx-zfunc-hwtest.fake.self
-6702741bcd9601c7b051723fa63e53a8962116adb048aa2b11d7772582c0298a  rsx-zfunc-hwtest.pkg
+277f91644afb0c61396eff4e9cd9f771e9990c6e00d1df685952ab82cfe0fd85  rsx-zfunc-hwtest.elf          (reproducible)
+83a238fe4d066f74bc48cd3cc51c17bff783df09ea8d16258854cd2219e517d9  rsx-zfunc-hwtest.fake.self    (reproducible)
+451190cb454e9faac57c34f84249bb70a17f8881364f4b55828c8f6e91a0959c  rsx-zfunc-hwtest.self         (this copy)
+6702741bcd9601c7b051723fa63e53a8962116adb048aa2b11d7772582c0298a  rsx-zfunc-hwtest.pkg          (this copy)
 ```
 
 (`make pkg` also emits a `.gnpdrm.pkg` retail-finalized variant; ship the
-plain `.pkg` for HEN. The SELF wrapped inside the pkg is byte-identical to the
-validated standalone SELF.)
+plain `.pkg` for HEN. The ELF wrapped inside every variant is the reproducible
+one above.)
 
 ## Register-level facts used
 
