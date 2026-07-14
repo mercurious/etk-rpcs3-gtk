@@ -84,12 +84,14 @@ Notes:
 
 ## Running it
 
-**Real PS3 (PS3HEN):** install `rsx-zfunc-hwtest.pkg` from HEN's Package
-Manager (it's a fakeNPDRM retail-format package; HEN installs these), then
-launch **RSX zfunc-remap hwtest** from the XMB Game column. Alternatively boot
-`rsx-zfunc-hwtest.self` directly, or `ps3load` the `.elf`. The scene is
-static; photograph the TV so the yellow-framed cells and the B matrix are
-legible. CROSS exits. See [PS3HEN-SETUP.md](PS3HEN-SETUP.md) for console prep.
+**Real PS3 (PS3HEN):** copy `rsx-zfunc-hwtest.pkg` to the **root of a FAT32
+USB** (the XMB installer reads FAT32 only — an NTFS/exFAT drive won't be
+listed), then XMB → Game → **Install Package Files** → install it, and launch
+**RSX zfunc-remap hwtest** from the Game column. The shipped pkg is the
+**finalized** retail package — the XMB tool won't list a non-finalized debug
+pkg. The scene is static; photograph the TV so the yellow-framed cells and the
+B matrix are legible. CROSS exits. See [PS3HEN-SETUP.md](PS3HEN-SETUP.md) for
+full console prep and troubleshooting.
 
 **RPCS3:** File → Boot → `rsx-zfunc-hwtest.self` (the `.pkg` is for real
 hardware; on RPCS3 boot the SELF directly).
@@ -120,12 +122,15 @@ not a reproducibility target. The `.fake.self` (fself) is deterministic.
 277f91644afb0c61396eff4e9cd9f771e9990c6e00d1df685952ab82cfe0fd85  rsx-zfunc-hwtest.elf          (reproducible)
 83a238fe4d066f74bc48cd3cc51c17bff783df09ea8d16258854cd2219e517d9  rsx-zfunc-hwtest.fake.self    (reproducible)
 451190cb454e9faac57c34f84249bb70a17f8881364f4b55828c8f6e91a0959c  rsx-zfunc-hwtest.self         (this copy)
-6702741bcd9601c7b051723fa63e53a8962116adb048aa2b11d7772582c0298a  rsx-zfunc-hwtest.pkg          (this copy)
+0cc2e61cbd444ee12fa4258e2316263f80a5fb85649e1a6b88fc8b10cb1cc8ad  rsx-zfunc-hwtest.pkg          (this copy, FINALIZED)
 ```
 
-(`make pkg` also emits a `.gnpdrm.pkg` retail-finalized variant; ship the
-plain `.pkg` for HEN. The ELF wrapped inside every variant is the reproducible
-one above.)
+**The shipped `rsx-zfunc-hwtest.pkg` is the FINALIZED (retail-flagged) package**
+— header byte `@0x04 = 0x80`. `make pkg` internally also produces a
+NON-finalized *debug* pkg (`@0x04 = 0x00`); build.sh overwrites it with the
+finalized bytes because the stock XMB **"Install Package Files"** tool on a
+CEX/HEN console only *lists* finalized packages — a debug pkg is silently
+invisible there. The ELF wrapped inside is the reproducible one above.
 
 ## Register-level facts used
 

@@ -45,13 +45,42 @@ before flashing** — HFW/HEN track together and roll forward
 
 ## Install & run the hwtest
 
-1. With HEN enabled: XMB → **Game → Package Manager → Install Package Files**
-   → pick `rsx-zfunc-hwtest.pkg` (HEN allows fakeNPDRM/retail/debug pkgs).
+**Two requirements the XMB installer is silent about — get both right or the
+package simply won't appear in the list (no error, just absent):**
+
+- **FAT32 USB, package at the ROOT.** The stock "Install Package Files" tool
+  reads **FAT32 only** — it cannot see an **NTFS or exFAT** drive at all. (The
+  NTFS drive from the disc-dump guide is for the 20 GB ISOs, which ManaGunZ
+  reads; it is the *wrong* drive for the pkg. Use a small separate FAT32 stick,
+  or the internal HDD, for the package.) Put `rsx-zfunc-hwtest.pkg` in the
+  drive root, not a subfolder.
+- **The pkg must be FINALIZED (retail-flagged).** The XMB tool only *lists*
+  finalized packages (header byte `@0x04 = 0x80`); a non-finalized *debug* pkg
+  (`0x00`) is silently filtered out. The `rsx-zfunc-hwtest.pkg` shipped in this
+  repo is already finalized — verify with `xxd -l8 rsx-zfunc-hwtest.pkg` (5th
+  byte must be `80`). *(An earlier build here shipped the non-finalized debug
+  pkg by mistake — that's what "package not recognized" was.)*
+
+Then:
+
+1. With HEN enabled: XMB → **Game → Install Package Files** (a.k.a. Package
+   Manager) → `rsx-zfunc-hwtest.pkg` → install.
 2. Launch **"RSX zfunc-remap hwtest"** from the Game column.
 3. It draws a static grid (see the main [README](README.md) for the layout).
    The four **yellow-framed** cells are the decisive GT5P parked state.
 4. **Photograph the TV** with the left grid (Matrix A + B) legible. That photo
    is the deliverable.
+
+### If the package still isn't listed
+
+- Re-check the drive is **FAT32** (not NTFS/exFAT) and the pkg is in the
+  **root**.
+- Confirm the pkg is **finalized** (`@0x04 == 0x80`, above).
+- Try HEN's package manager via **multiMAN / IRISMAN** instead of the stock XMB
+  tool — those install debug *and* finalized pkgs and are less picky about
+  location.
+- Last resort: FTP the pkg to the internal HDD (`/dev_hdd0/packages/`) and
+  install from there.
 
 ## What to look for (the verdict)
 

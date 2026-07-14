@@ -18,10 +18,19 @@
 #                               PS3 with HEN/CFW
 #   rsx-zfunc-hwtest.fake.self  fself variant, for loaders that want one
 #   rsx-zfunc-hwtest.elf        stripped + sprxlinker-fixed ELF (ps3load etc.)
+#   rsx-zfunc-hwtest.pkg        FINALIZED (retail-flagged) install package —
+#                               THIS is the one the XMB "Install Package Files"
+#                               tool on a CEX/HEN console lists and installs.
 #
-# NOTE: the raw linker output (before sprxlinker) has an empty PRX stub table
-# and dies at a null call in crt — always ship/boot the artifacts above, which
-# the Makefile produces from the fixed copy under build/.
+# TWO NOTES that each cost real debugging time:
+#   1. The raw linker output (before sprxlinker) has an empty PRX stub table and
+#      dies at a null call in crt — always ship/boot the sprxlinker-fixed
+#      artifacts above, which the Makefile produces from the fixed copy in build/.
+#   2. `make pkg` emits TWO packages: a NON-finalized debug pkg (header byte
+#      @0x04 = 0x00) and a FINALIZED retail pkg via package_finalize
+#      (header @0x04 = 0x80, written as *.gnpdrm.pkg). The stock XMB "Install
+#      Package Files" tool only *lists* FINALIZED packages — a debug pkg is
+#      invisible there. So we ship the finalized one AS rsx-zfunc-hwtest.pkg.
 
 set -e
 
@@ -39,13 +48,25 @@ docker run --rm --platform linux/amd64 \
     "$IMAGE" bash -c '
         set -e
         cp /opt/cg/libCg.so /usr/lib/x86_64-linux-gnu/ && ldconfig
-        make clean && make
+        make clean && make pkg
     '
 
 # ship the sprxlinker-fixed ELF, not the raw link output
 cp "$HWTEST_DIR/build/rsx-zfunc-hwtest.elf" "$HWTEST_DIR/rsx-zfunc-hwtest.elf"
 
+# ship the FINALIZED package as rsx-zfunc-hwtest.pkg (see note 2 in header);
+# the Makefile leaves the non-finalized debug pkg under the same base name, so
+# overwrite it with the finalized (.gnpdrm.pkg) bytes and drop the debug copy.
+cp "$HWTEST_DIR/rsx-zfunc-hwtest.gnpdrm.pkg" "$HWTEST_DIR/rsx-zfunc-hwtest.pkg"
+rm -f "$HWTEST_DIR/rsx-zfunc-hwtest.gnpdrm.pkg"
+
+# sanity: shipped pkg must be finalized (byte @0x04 == 0x80)
+if [ "$(dd if="$HWTEST_DIR/rsx-zfunc-hwtest.pkg" bs=1 skip=4 count=1 2>/dev/null | xxd -p)" != "80" ]; then
+    echo "error: shipped .pkg is NOT finalized — XMB Install Package Files would not list it" >&2
+    exit 1
+fi
+
 echo "== artifacts =="
-ls -la "$HWTEST_DIR"/rsx-zfunc-hwtest.elf "$HWTEST_DIR"/rsx-zfunc-hwtest.self "$HWTEST_DIR"/rsx-zfunc-hwtest.fake.self
-shasum -a 256 "$HWTEST_DIR"/rsx-zfunc-hwtest.elf "$HWTEST_DIR"/rsx-zfunc-hwtest.self "$HWTEST_DIR"/rsx-zfunc-hwtest.fake.self 2>/dev/null || \
-    sha256sum "$HWTEST_DIR"/rsx-zfunc-hwtest.elf "$HWTEST_DIR"/rsx-zfunc-hwtest.self "$HWTEST_DIR"/rsx-zfunc-hwtest.fake.self
+ls -la "$HWTEST_DIR"/rsx-zfunc-hwtest.elf "$HWTEST_DIR"/rsx-zfunc-hwtest.self "$HWTEST_DIR"/rsx-zfunc-hwtest.fake.self "$HWTEST_DIR"/rsx-zfunc-hwtest.pkg
+shasum -a 256 "$HWTEST_DIR"/rsx-zfunc-hwtest.elf "$HWTEST_DIR"/rsx-zfunc-hwtest.self "$HWTEST_DIR"/rsx-zfunc-hwtest.fake.self "$HWTEST_DIR"/rsx-zfunc-hwtest.pkg 2>/dev/null || \
+    sha256sum "$HWTEST_DIR"/rsx-zfunc-hwtest.elf "$HWTEST_DIR"/rsx-zfunc-hwtest.self "$HWTEST_DIR"/rsx-zfunc-hwtest.fake.self "$HWTEST_DIR"/rsx-zfunc-hwtest.pkg
