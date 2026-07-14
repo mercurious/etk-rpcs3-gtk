@@ -84,11 +84,15 @@ Notes:
 
 ## Running it
 
-**Real PS3 (HEN/CFW):** boot `rsx-zfunc-hwtest.self`, or `ps3load` the
-`.elf`. The scene is static; photograph the TV so the yellow-framed cells and
-the B matrix are legible. CROSS exits.
+**Real PS3 (PS3HEN):** install `rsx-zfunc-hwtest.pkg` from HEN's Package
+Manager (it's a fakeNPDRM retail-format package; HEN installs these), then
+launch **RSX zfunc-remap hwtest** from the XMB Game column. Alternatively boot
+`rsx-zfunc-hwtest.self` directly, or `ps3load` the `.elf`. The scene is
+static; photograph the TV so the yellow-framed cells and the B matrix are
+legible. CROSS exits. See [PS3HEN-SETUP.md](PS3HEN-SETUP.md) for console prep.
 
-**RPCS3:** File → Boot → `rsx-zfunc-hwtest.self`.
+**RPCS3:** File → Boot → `rsx-zfunc-hwtest.self` (the `.pkg` is for real
+hardware; on RPCS3 boot the SELF directly).
 
 Do **not** boot a raw ELF relinked from the objects without running psl1ght's
 `sprxlinker` on it — the raw linker output has an empty PRX stub table and
@@ -109,7 +113,12 @@ separately, never redistributed). Artifact hashes for this build:
 277f91644afb0c61396eff4e9cd9f771e9990c6e00d1df685952ab82cfe0fd85  rsx-zfunc-hwtest.elf
 b057c1dd9c7799ce88d4e6d1f09bad7542779f6d5c52b5a8b7067338805b068c  rsx-zfunc-hwtest.self
 83a238fe4d066f74bc48cd3cc51c17bff783df09ea8d16258854cd2219e517d9  rsx-zfunc-hwtest.fake.self
+6702741bcd9601c7b051723fa63e53a8962116adb048aa2b11d7772582c0298a  rsx-zfunc-hwtest.pkg
 ```
+
+(`make pkg` also emits a `.gnpdrm.pkg` retail-finalized variant; ship the
+plain `.pkg` for HEN. The SELF wrapped inside the pkg is byte-identical to the
+validated standalone SELF.)
 
 ## Register-level facts used
 
