@@ -1,0 +1,56 @@
+From: ETK GTK Edition <mercurious>
+Subject: [PATCH v0.7.5] simplify crash-overlay text to "GTK Crash Recovery"
+
+Release-prep polish (v0.7.1 kit release dossier, 2026-07-22): all three
+anti-lock rescue notices now show the same mixed-case "GTK Crash Recovery"
+-- the all-caps radio-speak variants were less legible on the rig panel
+(operator-directed). Durations unchanged (8 s recovering / 5 s absorbed).
+Version self-id bumped to v0.7.5 (get_verbose_version -> --version, log
+header, about dialog).
+
+Incremental over etk-rpcs3-gtk-edition-0.7.4-dev-ffs-v5-avwiden-v1.patch.
+Artifact: rpcs3-etk_gtk-edition-0.7.5_v0.0.41-19544-60c9705a_linux_aarch64.AppImage
+sha256 c464771932da20064f0942fc61f22df9d6e67bc52893f319d5d02cde1eaae02d
+(packaged via scripts/package-appimage.sh, MARKER="GTK Crash Recovery",
+VERIFY OK with system ffmpeg hidden).
+---
+--- a/rpcs3/Emu/RSX/VK/vkutils/sync.cpp
++++ b/rpcs3/Emu/RSX/VK/vkutils/sync.cpp
+@@ -650,7 +650,7 @@
+ 		}
+ 		if (now - since >= ETK_STALL_WARN_US && !pfence->etk_stale_warned.exchange(true))
+ 		{
+-			etk_queue_rescue_notice("GTK RESCUE: RECOVERING FROM CRASH - STANDBY, KEEP AT THE CONTROLS", 8'000'000);
++			etk_queue_rescue_notice("GTK Crash Recovery", 8'000'000);
+ 		}
+ 		if (now - since < etk_fence_force_threshold_us())
+ 		{
+@@ -662,7 +662,7 @@
+ 		const u64 n = ++g_etk_fence_forced_count;
+ 		rsx_log.error("ETK fence force-signal #%llu: fence stuck NOT_READY for >%llums (post-hangcheck orphan) - force-completing and continuing (GTK_FENCE_FORCE_SIGNAL).",
+ 			n, etk_fence_force_threshold_us() / 1000);
+-		etk_queue_rescue_notice("GTK RESCUE: CRASH ABSORBED - DRIVE ON", 5'000'000);
++		etk_queue_rescue_notice("GTK Crash Recovery", 5'000'000);
+ 		return true;
+ 	}
+ 
+@@ -677,7 +677,7 @@
+ 			// care which layer caught it.
+ 			if (etk_steady_now_us() - since >= ETK_STALL_WARN_US)
+ 			{
+-				etk_queue_rescue_notice("GTK RESCUE: CRASH ABSORBED - DRIVE ON", 5'000'000);
++				etk_queue_rescue_notice("GTK Crash Recovery", 5'000'000);
+ 			}
+ 			pfence->etk_stale_since_us.release(0);
+ 			pfence->etk_stale_warned.release(false);
+--- a/rpcs3/rpcs3_version.cpp
++++ b/rpcs3/rpcs3_version.cpp
+@@ -50,7 +50,7 @@
+ 	std::string get_verbose_version()
+ 	{
+ 		std::string version = fmt::format("%s | %s", rpcs3::get_version().to_string(), get_branch());
+-		fmt::append(version, " | GTK Edition v0.7.4");
++		fmt::append(version, " | GTK Edition v0.7.5");
+ 		if (is_local_build())
+ 		{
+ 			fmt::append(version, " | local_build");
