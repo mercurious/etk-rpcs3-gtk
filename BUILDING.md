@@ -14,8 +14,8 @@ native arm64 Docker runtime (colima); any arm64 Linux/Docker host works the same
 ## 1. Toolchain image (one-time, multi-hour)
 
 Build the CI image from RPCS3's public Dockerfile — `github.com/RPCS3/rpcs3-docker`, path
-`jammy-aarch64/Dockerfile` (Ubuntu 22.04 base; compiles GCC 13 + LLVM 22, a static LLVM for the
-JIT, CMake, Ninja, Qt 6, FFmpeg, SDL3, OpenCV from source at pinned versions):
+`jammy-aarch64/Dockerfile` (Ubuntu 22.04 base; compiles GCC 13 + a static LLVM 19.1.7 for the
+JIT (`/opt/llvm`), CMake, Ninja, Qt 6, FFmpeg, SDL3, OpenCV from source at pinned versions):
 
 ```sh
 git clone https://github.com/RPCS3/rpcs3-docker
@@ -29,9 +29,12 @@ Jammy's glibc 2.35 is older than ROCKNIX's (2.41), so the binary runs on the rig
 
 ```sh
 git clone https://github.com/RPCS3/rpcs3 && cd rpcs3
-git checkout 60c9705a          # v0.0.41-19544 — the patch base
-git apply /path/to/patches/etk-rpcs3-gtk-edition-0.6.0.patch
+git checkout a1deb2921         # v0.0.41-19638 — the patch base
+git apply /path/to/patches/etk-rpcs3-gtk-edition-0.8.0-dev.patch
 ```
+
+Base 19638 bumps RPCS3's PPU object-cache tag (`v7-kusa` → `v8-kusa`): the **first boot of each
+game recompiles all PPU modules** — long and thermally heavy on a handheld, not a hang.
 
 ## 3. Build (clang variant — the flavor ROCKNIX's package downloads)
 
@@ -90,9 +93,10 @@ Known packaging quirks (both benign, both hit in practice):
 
 ## 5. Verify
 
-The binary self-reports the stock upstream version string (the patch set doesn't bump it) —
-identify builds by **sha256**, not the About dialog. The 0.6.0 release asset (flicker fix
-default-on):
+Since 0.7.2 the fork self-identifies — `--version` prints the upstream build string plus
+`| GTK Edition v<ver>` — so check both that string and the **sha256**. (Builds ≤0.7.1
+report only the stock upstream string; identify those by sha256 alone.) The 0.6.0 GA
+release asset (flicker fix default-on), kept for the historical record:
 
 ```
 rpcs3-etk_gtk-edition-0.6.0_v0.0.41-19544-60c9705a_linux_aarch64.AppImage
@@ -133,6 +137,9 @@ git clone https://github.com/RPCS3/rpcs3 && cd rpcs3
 git checkout 60c9705a          # v0.0.41-19544 — the patch base
 git apply /path/to/patches/etk-rpcs3-gtk-edition-0.6.0.patch
 ```
+
+(This is the recipe for the validated 0.6.0-GA macOS artifact below. For a current-base build,
+use `git checkout a1deb2921` — v0.0.41-19638 — with `patches/etk-rpcs3-gtk-edition-0.8.0-dev.patch`.)
 
 ## 3. Configure + build
 
@@ -249,6 +256,9 @@ git checkout 60c9705a
 git submodule update --init --recursive --depth 1
 git apply \path\to\patches\etk-rpcs3-gtk-edition-0.6.0.patch
 ```
+
+(This is the recipe for the validated 0.6.0-GA Windows artifact below. For a current-base build,
+use `git checkout a1deb2921` — v0.0.41-19638 — with `patches\etk-rpcs3-gtk-edition-0.8.0-dev.patch`.)
 
 ## 3. Configure + build
 

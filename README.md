@@ -50,14 +50,26 @@ hardware data points.
 ## Lineage (downstream fork)
 
 > **Downstream patch series over RPCS3.**
-> Base: commit **`60c9705a`** (github.com/RPCS3/rpcs3 `master`, build `v0.0.41-19544`).
+> Base: commit **`a1deb2921`** (github.com/RPCS3/rpcs3 `master`, build `v0.0.41-19638`).
 > Upstream is the canonical source; this repository carries the delta as a single reviewed
 > cumulative patch per release:
+> - `patches/etk-rpcs3-gtk-edition-0.8.0-dev.patch` — **current** dev cumulative on base
+>   `a1deb2921` (21 files / ~1091 insertions): the full 0.7.5 feature set — remap fix,
+>   tguard v1–v6, perfstat, semapark-v2, ffs-v5, avwiden-v1, overlay polish — rebased
+>   onto the new base (clean 3-way merge; `decoded_remap()`, the fix's interposition
+>   point, is untouched by upstream's RSXTexture `attributes()` refactor). Base-bump
+>   motivation: upstream build 0.0.41-19638 landed kd-11's shader-interpreter MSAA +
+>   depth-redirect sampling (PR #19090), reported to fix GT6 track-shadow flicker.
+> - `patches/etk-rpcs3-gtk-edition-0.7.5-cumulative-19544.patch` — archival consolidation
+>   of everything shipped on the previous base `60c9705a` (v0.0.41-19544): the 0.6.x
+>   cumulative lane plus the incremental 0.7.x lane (`0.7.1-dev-perfstat-v1` →
+>   `0.7.2/0.7.3-dev-semapark` → `0.7.4-dev-ffs-v5-avwiden-v1` →
+>   `0.7.5-dev-overlay-simplify`, each still in `patches/` as shipped).
 > - `patches/etk-rpcs3-gtk-edition-0.6.0.patch` — 0.6.0 GA (5 files / ~214 insertions)
 > - `patches/etk-rpcs3-gtk-edition-0.6.1-dev-tguard-v6.patch` — tguard dev cumulative
 >   (14 files / ~388 insertions): everything in 0.6.0 **plus** the tguard device-loss
 >   crash-net (v1–v6), trigger top-end calibration, and the audio timeline logger.
-> - `patches/etk-rpcs3-gtk-edition-0.6.1-dev-ffs-v4.patch` — **current** dev cumulative
+> - `patches/etk-rpcs3-gtk-edition-0.6.1-dev-ffs-v4.patch` — prior dev cumulative
 >   (16 files / ~718 insertions): ffs-v3 **plus** anti-lock stage 3b, the FIFO-desync
 >   resync net (`GTK_FIFO_RESYNC=1`, budget `GTK_FIFO_RESYNC_TRIES` default 10). A burst
 >   of kernel hang-rescues drops many submits' guest-visible effects; the resulting RSX

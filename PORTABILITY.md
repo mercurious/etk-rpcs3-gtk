@@ -46,6 +46,11 @@ surrounding context will not match. Re-express the insert above by hand (or via 
 against your base), then game-test: a clean build does not prove correct emulation. Validate on your
 own target (drive Arcade → Daytona → bumper cam, no cars ahead; the flicker is view-dependent).
 
+Rebase data point (2026-07-31): a 3-way merge of the full patch set from base v0.0.41-19544
+(`60c9705a`) to v0.0.41-19638 (`a1deb2921`) was conflict-free — `fragment_texture::decoded_remap()`
+remains the single remap decode point through upstream's RSXTexture `attributes()` refactor, and
+upstream's new wrapper paths route through it, so the override applies uniformly.
+
 ## Canonical channel
 The durable home for this fix is **upstream RPCS3** — [issue #11912](https://github.com/RPCS3/rpcs3/issues/11912).
 If it lands there, every rpcs3-derived project (including RPCSX forks) picks it up through normal
