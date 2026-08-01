@@ -30,7 +30,7 @@ Jammy's glibc 2.35 is older than ROCKNIX's (2.41), so the binary runs on the rig
 ```sh
 git clone https://github.com/RPCS3/rpcs3 && cd rpcs3
 git checkout a1deb2921         # v0.0.41-19638 — the patch base
-git apply /path/to/patches/etk-rpcs3-gtk-edition-0.8.0-dev.patch
+git apply /path/to/patches/etk-rpcs3-gtk-edition-0.8.1-dev.patch
 ```
 
 Base 19638 bumps RPCS3's PPU object-cache tag (`v7-kusa` → `v8-kusa`): the **first boot of each
@@ -139,7 +139,7 @@ git apply /path/to/patches/etk-rpcs3-gtk-edition-0.6.0.patch
 ```
 
 (This is the recipe for the validated 0.6.0-GA macOS artifact below. For a current-base build,
-use `git checkout a1deb2921` — v0.0.41-19638 — with `patches/etk-rpcs3-gtk-edition-0.8.0-dev.patch`.)
+use `git checkout a1deb2921` — v0.0.41-19638 — with `patches/etk-rpcs3-gtk-edition-0.8.1-dev.patch`.)
 
 ## 3. Configure + build
 
@@ -258,7 +258,7 @@ git apply \path\to\patches\etk-rpcs3-gtk-edition-0.6.0.patch
 ```
 
 (This is the recipe for the validated 0.6.0-GA Windows artifact below. For a current-base build,
-use `git checkout a1deb2921` — v0.0.41-19638 — with `patches\etk-rpcs3-gtk-edition-0.8.0-dev.patch`.)
+use `git checkout a1deb2921` — v0.0.41-19638 — with `patches\etk-rpcs3-gtk-edition-0.8.1-dev.patch`.)
 
 ## 3. Configure + build
 

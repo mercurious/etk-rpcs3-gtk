@@ -53,7 +53,16 @@ hardware data points.
 > Base: commit **`a1deb2921`** (github.com/RPCS3/rpcs3 `master`, build `v0.0.41-19638`).
 > Upstream is the canonical source; this repository carries the delta as a single reviewed
 > cumulative patch per release:
-> - `patches/etk-rpcs3-gtk-edition-0.8.0-dev.patch` — **current** dev cumulative on base
+> - `patches/etk-rpcs3-gtk-edition-0.8.1-dev.patch` — **current** dev cumulative on base
+>   `a1deb2921` (23 files / ~1096 insertions): 0.8.0-dev **plus** a temporary revert of
+>   upstream `1d657c4e6` ("Skip"). That upstream commit stops registering the SPU
+>   reduced-loop pattern; bisected (8 hardware rounds, endpoints + 6 probes) as the cause
+>   of a deterministic `CellSpursKernel0` boot fatal in GT5P Spec II [BCUS98158, ISO] on
+>   aarch64 — skipping the pattern reroutes an older-SPURS-revision loop through standard
+>   SPU LLVM compilation, which miscompiles it on ARM64 (the special-casing had been
+>   masking it; x86 unaffected). Drop this revert once upstream fixes the underlying
+>   ARM64 codegen bug.
+> - `patches/etk-rpcs3-gtk-edition-0.8.0-dev.patch` — prior dev cumulative on base
 >   `a1deb2921` (21 files / ~1091 insertions): the full 0.7.5 feature set — remap fix,
 >   tguard v1–v6, perfstat, semapark-v2, ffs-v5, avwiden-v1, overlay polish — rebased
 >   onto the new base (clean 3-way merge; `decoded_remap()`, the fix's interposition
