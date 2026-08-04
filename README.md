@@ -53,7 +53,13 @@ hardware data points.
 > Base: commit **`a1deb2921`** (github.com/RPCS3/rpcs3 `master`, build `v0.0.41-19638`).
 > Upstream is the canonical source; this repository carries the delta as a single reviewed
 > cumulative patch per release:
-> - `patches/etk-rpcs3-gtk-edition-0.8.1-dev.patch` — **current** dev cumulative on base
+> - `patches/etk-rpcs3-gtk-edition-0.8.2-dev.patch` — **current** dev cumulative on base
+>   `a1deb2921`: identical source to 0.8.1-dev (below) except the self-ID; the release
+>   artifact is rebuilt with the **LLVM 22.1.8 toolchain image** (upstream rpcs3-docker
+>   `e261762`), picking up LLVM 22's arm64 backend optimizations. Deploy note: clear
+>   per-title `ppu-*` cache dirs at swap — v8-tagged PPU objects compiled by LLVM 19
+>   must not mix with an LLVM 22 binary.
+> - `patches/etk-rpcs3-gtk-edition-0.8.1-dev.patch` — prior dev cumulative on base
 >   `a1deb2921` (23 files / ~1096 insertions): 0.8.0-dev **plus** a temporary revert of
 >   upstream `1d657c4e6` ("Skip"). That upstream commit stops registering the SPU
 >   reduced-loop pattern; bisected (8 hardware rounds, endpoints + 6 probes) as the cause
