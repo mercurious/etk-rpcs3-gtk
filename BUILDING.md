@@ -22,6 +22,16 @@ git clone https://github.com/RPCS3/rpcs3-docker
 docker build -t etk-rpcs3-jammy-aarch64:local rpcs3-docker/jammy-aarch64
 ```
 
+**On every base bump, check image FRESHNESS, not just compatibility.** The trap is
+asymmetric: the build can *succeed* on a stale image while official builds ship a newer
+static LLVM with real codegen gains (lesson of 2026-08: our LLVM-19 image built base
+19638 fine, but official aarch64 builds had carried LLVM 22's arm64 backend since
+Jul 18). Two checks: (1) compatibility — `3rdparty/llvm/CMakeLists.txt` minimum vs the
+image's `/opt/llvm` version; (2) freshness — `git log` of rpcs3-docker's
+`jammy-aarch64/Dockerfile` (`STATIC_LLVM_VER`) vs what the local image was built from.
+A freshness gap is a *decision* (multi-hour rebuild vs deferred codegen), not an error —
+but make it consciously.
+
 Jammy's glibc 2.35 is older than ROCKNIX's (2.41), so the binary runs on the rig
 (backward-compat is one-directional: older-build → newer-runtime is safe).
 
