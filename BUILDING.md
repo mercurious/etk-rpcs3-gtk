@@ -32,6 +32,14 @@ image's `/opt/llvm` version; (2) freshness — `git log` of rpcs3-docker's
 A freshness gap is a *decision* (multi-hour rebuild vs deferred codegen), not an error —
 but make it consciously.
 
+**Preflight the VM disk before any image (re)build:** the Qt step needs ~15 GB of
+transient scratch on top of everything else; an ENOSPC at hour 22 presents as
+`Writing MOC compilation failed`, and the orphaned step-container then sits on its
+giant scratch layer until manually removed (lesson of 2026-08-04: 59 GB colima disk
+hit 100%). Check `colima ssh -- df -h /var/lib/docker` ≥ 25 GB free first; the
+Dockerfile's 15 separate RUN layers mean a failed run resumes from cache, so clean up
+the dead container and re-run rather than starting over.
+
 Jammy's glibc 2.35 is older than ROCKNIX's (2.41), so the binary runs on the rig
 (backward-compat is one-directional: older-build → newer-runtime is safe).
 
