@@ -62,13 +62,20 @@ hardware data points.
 >   again (13/13 verified in both patch and binary).
 > - `patches/etk-rpcs3-gtk-edition-0.8.3-dev.patch` — prior dev cumulative on base
 >   `a1deb2921`: 0.8.2-dev **plus** `__attribute__((optnone))` on
->   `spu_thread::stop_and_signal`. clang 22.1.8 `-O2` on aarch64 miscompiles that
->   function (clang 19.1.7 does not), corrupting the SPURS group exit/restart
->   context; pre-2008-SDK SPURS kernels (GT5P Spec II, BCUS98158) then restart at a
->   garbage PC and die. Decoder-independent — SPU LLVM, dynamic and static
->   interpreters all fail identically — and isolated by per-function `optnone`
->   bisection across 8 hardware boots. Mitigation only; drop it when the root cause
->   (compiler bug vs. latent UB in that function) is settled upstream.
+>   `spu_thread::stop_and_signal`, which restores GT5P Spec II [BCUS98158] on the
+>   LLVM-22 JIT build. Isolated by per-function `optnone` bisection across 8 hardware
+>   boots; the failure is decoder-independent (SPU LLVM, dynamic and static
+>   interpreters, and PPU interpreter all die at the same guest PC).
+>   **This is a mask, not a repair, and the mechanism is NOT a miscompile.**
+>   Disassembly of that function from the working (0.8.1) and failing (0.8.2)
+>   binaries is byte-identical — 1752 instructions, differing only in load address —
+>   and both builds use the same AOT compiler (clang 22.1.8; the 19.1.7→22.1.8
+>   difference is the statically linked *JIT* library). So `optnone` works by
+>   perturbing size/inlining under `-flto`, i.e. by shifting binary layout. Current
+>   theory: one latent memory bug (uninitialized/stale read or a race) in the SPURS
+>   thread-group exit/restart path, exercised only by pre-2008-SDK SPURS kernels,
+>   whose *visibility* flips with layout. Under that theory the 0.8.1 revert below
+>   is also a layout roll. Instrumented (ASan/UBSan) investigation is open.
 > - `patches/etk-rpcs3-gtk-edition-0.8.2-dev.patch` — prior dev cumulative on base
 >   `a1deb2921`: identical source to 0.8.1-dev (below) except the self-ID; the release
 >   artifact is rebuilt with the **LLVM 22.1.8 toolchain image** (upstream rpcs3-docker
