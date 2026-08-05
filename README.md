@@ -53,7 +53,14 @@ hardware data points.
 > Base: commit **`a1deb2921`** (github.com/RPCS3/rpcs3 `master`, build `v0.0.41-19638`).
 > Upstream is the canonical source; this repository carries the delta as a single reviewed
 > cumulative patch per release:
-> - `patches/etk-rpcs3-gtk-edition-0.8.3-dev.patch` — **current** dev cumulative on base
+> - `patches/etk-rpcs3-gtk-edition-0.8.4-dev.patch` — **current** dev cumulative on base
+>   `a1deb2921`: 0.8.3-dev **plus the restored `GTK_PROBE_11912` TIU transition probe**.
+>   That probe — the instrument that localized #11912 — was silently dropped in the 0.7.x
+>   consolidation and was absent from 0.7.5 through 0.8.3, so `GTK_PROBE_11912=1` did
+>   nothing on those builds. Recovered from the 0.6.0 patch and re-anchored;
+>   `scripts/verify-markers.sh` now fails the build if any shipped feature goes missing
+>   again (13/13 verified in both patch and binary).
+> - `patches/etk-rpcs3-gtk-edition-0.8.3-dev.patch` — prior dev cumulative on base
 >   `a1deb2921`: 0.8.2-dev **plus** `__attribute__((optnone))` on
 >   `spu_thread::stop_and_signal`. clang 22.1.8 `-O2` on aarch64 miscompiles that
 >   function (clang 19.1.7 does not), corrupting the SPURS group exit/restart
