@@ -53,7 +53,16 @@ hardware data points.
 > Base: commit **`a1deb2921`** (github.com/RPCS3/rpcs3 `master`, build `v0.0.41-19638`).
 > Upstream is the canonical source; this repository carries the delta as a single reviewed
 > cumulative patch per release:
-> - `patches/etk-rpcs3-gtk-edition-0.8.2-dev.patch` — **current** dev cumulative on base
+> - `patches/etk-rpcs3-gtk-edition-0.8.3-dev.patch` — **current** dev cumulative on base
+>   `a1deb2921`: 0.8.2-dev **plus** `__attribute__((optnone))` on
+>   `spu_thread::stop_and_signal`. clang 22.1.8 `-O2` on aarch64 miscompiles that
+>   function (clang 19.1.7 does not), corrupting the SPURS group exit/restart
+>   context; pre-2008-SDK SPURS kernels (GT5P Spec II, BCUS98158) then restart at a
+>   garbage PC and die. Decoder-independent — SPU LLVM, dynamic and static
+>   interpreters all fail identically — and isolated by per-function `optnone`
+>   bisection across 8 hardware boots. Mitigation only; drop it when the root cause
+>   (compiler bug vs. latent UB in that function) is settled upstream.
+> - `patches/etk-rpcs3-gtk-edition-0.8.2-dev.patch` — prior dev cumulative on base
 >   `a1deb2921`: identical source to 0.8.1-dev (below) except the self-ID; the release
 >   artifact is rebuilt with the **LLVM 22.1.8 toolchain image** (upstream rpcs3-docker
 >   `e261762`), picking up LLVM 22's arm64 backend optimizations. Deploy note: clear
