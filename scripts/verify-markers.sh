@@ -52,6 +52,18 @@ MARKERS=(
 # code). is_device_lost is a symbol, not a string, so it is patch-only.
 BINARY_EXEMPT="is_device_lost"
 
+# An explicitly declared baseline may waive the feature gate. The declaration
+# lives IN the patch file (committed, visible, greppable) -- never in an env
+# var or a flag, which is how a waiver would go silent. The gate is reduced to
+# build self-identification, not removed: a binary that cannot say what it is
+# does not ship. Loud by design -- a waived gate is not a passed gate.
+WAIVER=$(grep -m1 '^GTK-Markers-Waiver:' "$PATCH" 2>/dev/null | cut -d: -f2- | sed 's/^ *//')
+if [ -n "$WAIVER" ]; then
+    echo "!! MARKERS WAIVED: $WAIVER"
+    echo "!! gate reduced to 'GTK Edition' (build self-identification) only"
+    MARKERS=( "GTK Edition|0.7.2|build self-identification" )
+fi
+
 fail=0
 echo "== markers in $(basename "$PATCH") =="
 for entry in "${MARKERS[@]}"; do
