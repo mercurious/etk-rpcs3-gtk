@@ -39,7 +39,7 @@ index 681afe8fe..22f5a0d2d 100644
  option(BUILD_LLVM "Build LLVM from git submodule" OFF)
  option(STATIC_LINK_LLVM "Link against LLVM statically. This will get set to ON if you build LLVM from the submodule." OFF)
 diff --git a/Utilities/Thread.cpp b/Utilities/Thread.cpp
-index 63555a913..c5565b2a9 100644
+index 63555a913..469c96e6a 100644
 --- a/Utilities/Thread.cpp
 +++ b/Utilities/Thread.cpp
 @@ -1,5 +1,15 @@
@@ -58,7 +58,18 @@ index 63555a913..c5565b2a9 100644
  #include "Emu/Cell/SPUThread.h"
  #include "Emu/Cell/PPUThread.h"
  #include "Emu/Cell/PPUDisAsm.h"
-@@ -3766,7 +3776,25 @@ bool thread_base::join(bool dtor) const
+@@ -68,6 +78,10 @@ DYNAMIC_IMPORT_RENAME("Kernel32.dll", SetThreadDescriptionImport, "SetThreadDesc
+ #include <sys/syscall.h>
+ #include <sys/timerfd.h>
+ #include <unistd.h>
++// The cpu_capacity reader below uses ::open with O_* flags. Bionic pulls
++// <fcntl.h> in transitively, glibc does not -- the first Linux build of this
++// tree failed right here.
++#include <fcntl.h>
+ #endif
+ #ifdef __ANDROID__
+ // For the allocation-free breadcrumb the fault handler writes before it risks anything else, and
+@@ -3766,7 +3780,25 @@ bool thread_base::join(bool dtor) const
  
  		if (i >= 16 && !(i & (i - 1)) && timeout != atomic_wait_timeout::inf)
  		{

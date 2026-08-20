@@ -1,5 +1,20 @@
 GTK-Markers-Waiver: mint1 raw leap-frog baseline (deliberate; A/B vs shipped 0.8.1 -- no ETK identity by design)
 
+diff --git a/Utilities/Thread.cpp b/Utilities/Thread.cpp
+index 63555a913..9d221a061 100644
+--- a/Utilities/Thread.cpp
++++ b/Utilities/Thread.cpp
+@@ -68,6 +68,10 @@ DYNAMIC_IMPORT_RENAME("Kernel32.dll", SetThreadDescriptionImport, "SetThreadDesc
+ #include <sys/syscall.h>
+ #include <sys/timerfd.h>
+ #include <unistd.h>
++// The cpu_capacity reader below uses ::open with O_* flags. Bionic pulls
++// <fcntl.h> in transitively, glibc does not -- the first Linux build of this
++// tree failed right here.
++#include <fcntl.h>
+ #endif
+ #ifdef __ANDROID__
+ // For the allocation-free breadcrumb the fault handler writes before it risks anything else, and
 diff --git a/rpcs3/Emu/CMakeLists.txt b/rpcs3/Emu/CMakeLists.txt
 index 1ebd01837..0bbcb5a7b 100644
 --- a/rpcs3/Emu/CMakeLists.txt
