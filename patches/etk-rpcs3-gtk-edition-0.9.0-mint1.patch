@@ -1,0 +1,10 @@
+--- a/rpcs3/rpcs3_version.cpp
++++ b/rpcs3/rpcs3_version.cpp
+@@ -50,6 +50,7 @@
+ 	std::string get_verbose_version()
+ 	{
+ 		std::string version = fmt::format("%s | %s", rpcs3::get_version().to_string(), get_branch());
++		fmt::append(version, " | GTK Edition v0.9.0-mint1 (leapfrog raw armsx3-f707458b0)");
+ 		if (is_local_build())
+ 		{
+ 			fmt::append(version, " | local_build");
