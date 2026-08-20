@@ -43,6 +43,39 @@ index 1ebd01837..0bbcb5a7b 100644
  if(USE_FAUDIO)
      find_package(SDL3)
      if(SDL3_FOUND AND SDL3_VERSION VERSION_GREATER_EQUAL 3.2.0)
+diff --git a/rpcs3/Emu/Cell/SPUAnalyser.h b/rpcs3/Emu/Cell/SPUAnalyser.h
+index 1598551c7..bf4effd44 100644
+--- a/rpcs3/Emu/Cell/SPUAnalyser.h
++++ b/rpcs3/Emu/Cell/SPUAnalyser.h
+@@ -1,5 +1,10 @@
+ #pragma once
+ 
++// See SPUOpcodes.h: X11's X.h leaks a CWX macro that clobbers the opcode
++// name in desktop TUs which saw X headers first. Same protection here --
++// this header spells CWX as an enum member and in the NAME table.
++#undef CWX
++
+ // SPU Instruction Type
+ struct spu_itype
+ {
+diff --git a/rpcs3/Emu/Cell/SPUOpcodes.h b/rpcs3/Emu/Cell/SPUOpcodes.h
+index 42d76792a..52b60f1a7 100644
+--- a/rpcs3/Emu/Cell/SPUOpcodes.h
++++ b/rpcs3/Emu/Cell/SPUOpcodes.h
+@@ -1,5 +1,13 @@
+ #pragma once
+ 
++// X11's X.h defines CWX (a ConfigureWindow value mask) as a bare macro, which
++// clobbers the SPU opcode name of the same spelling in any desktop TU that saw
++// X headers before this one -- the perf overlay does, via the display chain
++// under HAVE_X11, since it reads SPU state through SPUThread.h. Android never
++// meets X11, which is why this only surfaces on a Linux build. #undef of an
++// undefined macro is well-formed, so this costs nothing everywhere else.
++#undef CWX
++
+ #include "Utilities/BitField.h"
+ 
+ union spu_opcode_t
 diff --git a/rpcs3/rpcs3_version.cpp b/rpcs3/rpcs3_version.cpp
 index d33c786f7..ec4a6edd7 100644
 --- a/rpcs3/rpcs3_version.cpp
