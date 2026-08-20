@@ -85,6 +85,34 @@ index 63555a913..c5565b2a9 100644
  		}
  	}
  
+diff --git a/rpcs3/Emu/CMakeLists.txt b/rpcs3/Emu/CMakeLists.txt
+index 1ebd01837..0bbcb5a7b 100644
+--- a/rpcs3/Emu/CMakeLists.txt
++++ b/rpcs3/Emu/CMakeLists.txt
+@@ -151,10 +151,22 @@ target_sources(rpcs3_emu PRIVATE
+     Audio/AudioDumper.cpp
+     Audio/AudioBackend.cpp
+     Audio/Cubeb/CubebBackend.cpp
+-    Audio/Oboe/OboeBackend.cpp
+     Audio/Cubeb/cubeb_enumerator.cpp
+ )
+ 
++# ARMSX3: the Oboe audio backend is Android-only. Its headers come from
++# 3rdparty::oboe, which is linked only on Android (see the link block below),
++# so listing the source unconditionally breaks every non-Android build at
++# dependency scanning ('oboe/Oboe.h' file not found) -- found by the first
++# Linux build of this tree. The backend is only ever constructed from the
++# Android bridge; no code under rpcs3/ references it, so a desktop build
++# loses nothing by never parsing it.
++if(ANDROID)
++    target_sources(rpcs3_emu PRIVATE
++        Audio/Oboe/OboeBackend.cpp
++    )
++endif()
++
+ if(USE_FAUDIO)
+     find_package(SDL3)
+     if(SDL3_FOUND AND SDL3_VERSION VERSION_GREATER_EQUAL 3.2.0)
 diff --git a/rpcs3/Emu/Cell/Modules/cellAudio.cpp b/rpcs3/Emu/Cell/Modules/cellAudio.cpp
 index 99a8f9690..631ac3227 100644
 --- a/rpcs3/Emu/Cell/Modules/cellAudio.cpp

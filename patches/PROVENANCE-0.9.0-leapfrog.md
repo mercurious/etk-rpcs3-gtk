@@ -8,8 +8,8 @@ commits © jpolo1224.
 
 | patch | applies to | composition | gate |
 |---|---|---|---|
-| `etk-rpcs3-gtk-edition-0.9.0-mint1.patch` | f707458b0 | version literal only — declared baseline (`GTK-Markers-Waiver:` in-patch) | GTK Edition only, WAIVED loudly |
-| `etk-rpcs3-gtk-edition-0.9.0-leapfrog-v1.patch` | f707458b0 | 0001 restore upstream ISO hardening (undo the pin's HEAD revert) + 0002 ETK_CONSTRAINED_HOST (widen 6 mobile-profile gates; -D flag rides .ci) + 0003 ETK identity rebased per-hunk (58 hunks: 41 KEEP / 16 ADAPT / 1 DROP=CRLF) | 13/13 markers, no waiver |
+| `etk-rpcs3-gtk-edition-0.9.0-mint1.patch` | f707458b0 | version literal + Linux build fix (Oboe source guard) — declared baseline (`GTK-Markers-Waiver:` in-patch) | GTK Edition only, WAIVED loudly |
+| `etk-rpcs3-gtk-edition-0.9.0-leapfrog-v1.patch` | f707458b0 | 0001 restore upstream ISO hardening (undo the pin's HEAD revert) + 0002 ETK_CONSTRAINED_HOST (widen 6 mobile-profile gates; -D flag rides .ci) + 0003 ETK identity rebased per-hunk (58 hunks: 41 KEEP / 16 ADAPT / 1 DROP=CRLF) + 0004 Linux build fix (Oboe backend source was unconditional; oboe headers are Android-only — found by forge run 20260820-145013, the tree's first Linux build, which otherwise configured and compiled clean to ~400 files) | 13/13 markers, no waiver |
 
 0003 reversals-by-validation worth knowing: fence force-signal KEPT (base
 still ends in vkWaitForFences(UINT64_MAX)); semapark KEPT as an adaptation
