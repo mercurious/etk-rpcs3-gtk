@@ -323,3 +323,26 @@ the fix is on by default. Field-validated 2026-07-09: GT5P road stays lit at Day
 AMD Radeon RDNA2 via AMD's native Vulkan driver, with
 `GTK-REMAP0: force-ONE override engaged (TIU15 raw=0x00000000)` in the log — the same parked-TIU
 signature seen on Adreno 650 (TIU15) and Apple M1 (TIU11).
+
+## Leap-frog base (0.9.0+): ARMSX3, not upstream RPCS3
+
+From 0.9.0 the base is the ARMSX3 fork (Android RPCS3, tracks Aug-2026
+upstream): `https://github.com/ARMSX2/ARMSX3` @ `f707458b0`. Its upstream
+ancestor chain contains our old pin `a1deb2921` (484 commits back), so
+history and provenance stay linear. GPL-2.0 throughout; fork commits
+(c) jpolo1224 — see patches/PROVENANCE-0.9.0-leapfrog.md.
+
+Toolchain: the CI image MUST carry the AArch64 GHC emergency-spill fix in
+its static LLVM — nothing in any tree applies it (the base's own in-code
+fallback logs `Retrying module ... allocator-friendly codegen` when it is
+missing; that line in RPCS3.log means STOP). Build the image with
+`scripts/build-image-etk.sh` (clones RPCS3/rpcs3-docker, injects the patch
+from rpcs3-docker-overlay/, tags etk-rpcs3-jammy-aarch64:llvm22).
+
+Then as before, with the new pin:
+
+    git remote add armsx3 https://github.com/ARMSX2/ARMSX3.git && git fetch armsx3
+    git checkout f707458b0
+    git apply patches/etk-rpcs3-gtk-edition-0.9.0.patch
+
+Forge lane knobs: FORGE_RPCS3_BASE=f707458b0, MARKER=rpcs3_perf_stat.
