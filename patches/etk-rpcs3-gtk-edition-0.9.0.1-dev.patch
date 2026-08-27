@@ -97,7 +97,7 @@ index 63555a913..469c96e6a 100644
  	}
  
 diff --git a/rpcs3/Emu/CMakeLists.txt b/rpcs3/Emu/CMakeLists.txt
-index 41edb11e4..68ace20bb 100644
+index 41edb11e4..07022a22d 100644
 --- a/rpcs3/Emu/CMakeLists.txt
 +++ b/rpcs3/Emu/CMakeLists.txt
 @@ -151,10 +151,22 @@ target_sources(rpcs3_emu PRIVATE
@@ -124,6 +124,71 @@ index 41edb11e4..68ace20bb 100644
  if(USE_FAUDIO)
      find_package(SDL3)
      if(SDL3_FOUND AND SDL3_VERSION VERSION_GREATER_EQUAL 3.2.0)
+@@ -627,6 +639,38 @@ if(NOT APPLE)
+ endif()
+ 
+ if(TARGET 3rdparty_vulkan)
++    # ETK 0.9.0.1: the FrameGen sources compile on ANDROID ONLY. (1) They do
++    # not build anywhere else: FrameGenTypes.h includes a "Config.h" that
++    # exists nowhere in this repository (the Android releases evidently build
++    # against an untracked local file). (2) Their licensing is unresolved
++    # in-tree: FrameGenTypes.h still carries "do not carry these files" into
++    # GPL-2.0-only RPCS3, while the comment kept below claims an author
++    # relicense. The desktop glue (VKFrameGen.cpp) already stubs the entire
++    # vk::frame_gen API behind #ifdef __ANDROID__, so gating the sources
++    # matches the port's own design.
++    if(ANDROID)
++        target_sources(rpcs3_emu PRIVATE
++            # Frame generation, ported from Eden (CamilleLaVey, eden PR #4263) via ARMSX2, and
++            # relicensed GPL-2.0-or-later by its author for use here. Runs the passes on OUR device
++            # in our own present path -- the earlier implementation lived behind a dlopen'd .so with
++            # its own VkDevice, which forced every frame through an AHardwareBuffer round-trip.
++            RSX/VK/FrameGen/FrameGen.cpp
++            RSX/VK/FrameGen/FrameGenPacer.cpp
++            RSX/VK/FrameGen/LosslessDll.cpp
++            RSX/VK/FrameGen/LsfgAlpha.cpp
++            RSX/VK/FrameGen/LsfgBeta.cpp
++            RSX/VK/FrameGen/LsfgChain.cpp
++            RSX/VK/FrameGen/LsfgCommon.cpp
++            RSX/VK/FrameGen/LsfgDelta.cpp
++            RSX/VK/FrameGen/LsfgGamma.cpp
++            RSX/VK/FrameGen/LsfgGenerate.cpp
++            RSX/VK/FrameGen/LsfgMipmaps.cpp
++            RSX/VK/FrameGen/LsfgShaders.cpp
++            RSX/VK/FrameGen/LsfgTranslate.cpp
++            RSX/VK/FrameGen/LsfgUtil.cpp
++            RSX/VK/FrameGen/LsfgVkCompat.cpp
++        )
++    endif()
+     target_sources(rpcs3_emu PRIVATE
+         RSX/VK/upscalers/fsr1/fsr_pass.cpp
+         RSX/VK/upscalers/sgsr/sgsr_pass.cpp
+@@ -649,25 +693,6 @@ if(TARGET 3rdparty_vulkan)
+         RSX/VK/vkutils/sampler.cpp
+         RSX/VK/vkutils/shared.cpp
+         RSX/VK/vkutils/unique_resource.cpp
+-        # Frame generation, ported from Eden (CamilleLaVey, eden PR #4263) via ARMSX2, and
+-        # relicensed GPL-2.0-or-later by its author for use here. Runs the passes on OUR device
+-        # in our own present path -- the earlier implementation lived behind a dlopen'd .so with
+-        # its own VkDevice, which forced every frame through an AHardwareBuffer round-trip.
+-        RSX/VK/FrameGen/FrameGen.cpp
+-        RSX/VK/FrameGen/FrameGenPacer.cpp
+-        RSX/VK/FrameGen/LosslessDll.cpp
+-        RSX/VK/FrameGen/LsfgAlpha.cpp
+-        RSX/VK/FrameGen/LsfgBeta.cpp
+-        RSX/VK/FrameGen/LsfgChain.cpp
+-        RSX/VK/FrameGen/LsfgCommon.cpp
+-        RSX/VK/FrameGen/LsfgDelta.cpp
+-        RSX/VK/FrameGen/LsfgGamma.cpp
+-        RSX/VK/FrameGen/LsfgGenerate.cpp
+-        RSX/VK/FrameGen/LsfgMipmaps.cpp
+-        RSX/VK/FrameGen/LsfgShaders.cpp
+-        RSX/VK/FrameGen/LsfgTranslate.cpp
+-        RSX/VK/FrameGen/LsfgUtil.cpp
+-        RSX/VK/FrameGen/LsfgVkCompat.cpp
+         RSX/VK/VKAsyncScheduler.cpp
+         RSX/VK/VKCommandStream.cpp
+         RSX/VK/VKCommonDecompiler.cpp
 diff --git a/rpcs3/Emu/Cell/Modules/cellAudio.cpp b/rpcs3/Emu/Cell/Modules/cellAudio.cpp
 index 14d38648a..ececebf3e 100644
 --- a/rpcs3/Emu/Cell/Modules/cellAudio.cpp
