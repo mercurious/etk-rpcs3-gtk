@@ -49,15 +49,88 @@ hardware data points.
 
 ## Lineage (downstream fork)
 
-> **Downstream patch series over RPCS3.**
-> Base: commit **`60c9705a`** (github.com/RPCS3/rpcs3 `master`, build `v0.0.41-19544`).
-> Upstream is the canonical source; this repository carries the delta as a single reviewed
-> cumulative patch per release:
+> **Downstream patch series — since 0.9.0 over [ARMSX3](https://github.com/ARMSX2/ARMSX3)
+> (the ARM64-focused RPCS3 fork, itself tracking RPCS3 upstream), previously over RPCS3
+> directly.** Current base: commit **`a74a0f3e0`** (ARMSX2/ARMSX3 `master`, 2026-08-24).
+> The 0.8.x line's base was **`a1deb2921`** (github.com/RPCS3/rpcs3 `master`, build
+> `v0.0.41-19638`). Upstream is the canonical source; this repository carries the delta as
+> a single reviewed cumulative patch per release:
+> - `patches/etk-rpcs3-gtk-edition-0.9.0.1-dev.patch` — **current** dev cumulative on base
+>   **`a74a0f3e0`**: the 0.9.0 set rebased across 134 upstream commits (one conflict:
+>   cellAudio telemetry vs upstream's `note_untouched()` baseline decay — both kept).
+>   0.9.0's ISO-reader commit is DROPPED as superseded: upstream `2f0c63ac1` restores the
+>   same tolerant short-read behaviour with zero-init, and our version's guard was a
+>   precedence bug (`!read == 5`, always false) that quietly reintroduced the
+>   uninitialised-read UB it meant to remove. Rides with (not in) the patch: upstream's
+>   driver pipeline cache ships default-ON with an `ARMSX3_PIPELINE_CACHE=0` env
+>   kill-switch — the ETK stack launches with it OFF until the core change is A/B-isolated
+>   (upstream's own `2f0c63ac1` message names the cache as a suspect in a loading-screen
+>   hang).
+> - `patches/etk-rpcs3-gtk-edition-0.9.0.patch` — the **leap-frog GA** (2026-08-20): base
+>   moved from RPCS3 `a1deb2921` to **ARMSX2/ARMSX3 `f707458b0`**. Gate: N=3 GT5P
+>   SURVIVED+CLEAN+CLEAN — first ledger-CLEAN rows on the title; boss-block survives
+>   25 (0.8.5) → 6 (raw base) → 1 (0.9.0), dossier `LeapfrogGate_N3_20260820`. Adds
+>   `ETK_CONSTRAINED_HOST` (the fork's mobile-profile gates widened to the rig) + three
+>   Linux build fixes (the Oboe backend is Android-only; `<fcntl.h>` for the cpu_capacity
+>   reader; X11's `CWX` macro vs the SPU opcode of that name). `0.9.0-leapfrog-v1` /
+>   `0.9.0-mint1` in `patches/` are the stepping-stone mints.
+> - `patches/etk-rpcs3-gtk-edition-0.8.5-dev.patch` — last RPCS3-based dev cumulative on
+>   `a1deb2921`: 0.8.4-dev **plus** the TEXCACHE-UNLOCK net (`GTK_TEXCACHE_UNLOCK`).
+> - `patches/etk-rpcs3-gtk-edition-0.8.4-dev.patch` — dev cumulative on base
+>   `a1deb2921`: 0.8.3-dev **plus the restored `GTK_PROBE_11912` TIU transition probe**.
+>   That probe — the instrument that localized #11912 — was silently dropped in the 0.7.x
+>   consolidation and was absent from 0.7.5 through 0.8.3, so `GTK_PROBE_11912=1` did
+>   nothing on those builds. Recovered from the 0.6.0 patch and re-anchored;
+>   `scripts/verify-markers.sh` now fails the build if any shipped feature goes missing
+>   again (13/13 verified in both patch and binary).
+> - `patches/etk-rpcs3-gtk-edition-0.8.3-dev.patch` — prior dev cumulative on base
+>   `a1deb2921`: 0.8.2-dev **plus** `__attribute__((optnone))` on
+>   `spu_thread::stop_and_signal`, which restores GT5P Spec II [BCUS98158] on the
+>   LLVM-22 JIT build. Isolated by per-function `optnone` bisection across 8 hardware
+>   boots; the failure is decoder-independent (SPU LLVM, dynamic and static
+>   interpreters, and PPU interpreter all die at the same guest PC).
+>   **This is a mask, not a repair, and the mechanism is NOT a miscompile.**
+>   Disassembly of that function from the working (0.8.1) and failing (0.8.2)
+>   binaries is byte-identical — 1752 instructions, differing only in load address —
+>   and both builds use the same AOT compiler (clang 22.1.8; the 19.1.7→22.1.8
+>   difference is the statically linked *JIT* library). So `optnone` works by
+>   perturbing size/inlining under `-flto`, i.e. by shifting binary layout. Current
+>   theory: one latent memory bug (uninitialized/stale read or a race) in the SPURS
+>   thread-group exit/restart path, exercised only by pre-2008-SDK SPURS kernels,
+>   whose *visibility* flips with layout. Under that theory the 0.8.1 revert below
+>   is also a layout roll. Instrumented (ASan/UBSan) investigation is open.
+> - `patches/etk-rpcs3-gtk-edition-0.8.2-dev.patch` — prior dev cumulative on base
+>   `a1deb2921`: identical source to 0.8.1-dev (below) except the self-ID; the release
+>   artifact is rebuilt with the **LLVM 22.1.8 toolchain image** (upstream rpcs3-docker
+>   `e261762`), picking up LLVM 22's arm64 backend optimizations. Deploy note: clear
+>   per-title `ppu-*` cache dirs at swap — v8-tagged PPU objects compiled by LLVM 19
+>   must not mix with an LLVM 22 binary.
+> - `patches/etk-rpcs3-gtk-edition-0.8.1-dev.patch` — prior dev cumulative on base
+>   `a1deb2921` (23 files / ~1096 insertions): 0.8.0-dev **plus** a temporary revert of
+>   upstream `1d657c4e6` ("Skip"). That upstream commit stops registering the SPU
+>   reduced-loop pattern; bisected (8 hardware rounds, endpoints + 6 probes) as the cause
+>   of a deterministic `CellSpursKernel0` boot fatal in GT5P Spec II [BCUS98158, ISO] on
+>   aarch64 — skipping the pattern reroutes an older-SPURS-revision loop through standard
+>   SPU LLVM compilation, which miscompiles it on ARM64 (the special-casing had been
+>   masking it; x86 unaffected). Drop this revert once upstream fixes the underlying
+>   ARM64 codegen bug.
+> - `patches/etk-rpcs3-gtk-edition-0.8.0-dev.patch` — prior dev cumulative on base
+>   `a1deb2921` (21 files / ~1091 insertions): the full 0.7.5 feature set — remap fix,
+>   tguard v1–v6, perfstat, semapark-v2, ffs-v5, avwiden-v1, overlay polish — rebased
+>   onto the new base (clean 3-way merge; `decoded_remap()`, the fix's interposition
+>   point, is untouched by upstream's RSXTexture `attributes()` refactor). Base-bump
+>   motivation: upstream build 0.0.41-19638 landed kd-11's shader-interpreter MSAA +
+>   depth-redirect sampling (PR #19090), reported to fix GT6 track-shadow flicker.
+> - `patches/etk-rpcs3-gtk-edition-0.7.5-cumulative-19544.patch` — archival consolidation
+>   of everything shipped on the previous base `60c9705a` (v0.0.41-19544): the 0.6.x
+>   cumulative lane plus the incremental 0.7.x lane (`0.7.1-dev-perfstat-v1` →
+>   `0.7.2/0.7.3-dev-semapark` → `0.7.4-dev-ffs-v5-avwiden-v1` →
+>   `0.7.5-dev-overlay-simplify`, each still in `patches/` as shipped).
 > - `patches/etk-rpcs3-gtk-edition-0.6.0.patch` — 0.6.0 GA (5 files / ~214 insertions)
 > - `patches/etk-rpcs3-gtk-edition-0.6.1-dev-tguard-v6.patch` — tguard dev cumulative
 >   (14 files / ~388 insertions): everything in 0.6.0 **plus** the tguard device-loss
 >   crash-net (v1–v6), trigger top-end calibration, and the audio timeline logger.
-> - `patches/etk-rpcs3-gtk-edition-0.6.1-dev-ffs-v4.patch` — **current** dev cumulative
+> - `patches/etk-rpcs3-gtk-edition-0.6.1-dev-ffs-v4.patch` — prior dev cumulative
 >   (16 files / ~718 insertions): ffs-v3 **plus** anti-lock stage 3b, the FIFO-desync
 >   resync net (`GTK_FIFO_RESYNC=1`, budget `GTK_FIFO_RESYNC_TRIES` default 10). A burst
 >   of kernel hang-rescues drops many submits' guest-visible effects; the resulting RSX
