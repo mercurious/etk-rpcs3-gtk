@@ -1295,6 +1295,23 @@ index 21f8a5bc4..3593af5ca 100644
  		std::deque<frame_time_t> frame_times;
  		u32 prevent_preempt_increase_tickets = 0;
  		u64 preempt_fail_old_preempt_count = 0;
+diff --git a/rpcs3/Emu/RSX/VK/VKFrameGen.cpp b/rpcs3/Emu/RSX/VK/VKFrameGen.cpp
+index 31e4ec773..2442ec345 100644
+--- a/rpcs3/Emu/RSX/VK/VKFrameGen.cpp
++++ b/rpcs3/Emu/RSX/VK/VKFrameGen.cpp
+@@ -825,7 +825,11 @@ namespace vk::frame_gen
+ 	}
+ 
+ #else
+-	bool capture_presented_frame(const vk::command_buffer&, const vk::render_device&, VkImage, VkImageLayout, u32, u32)
++	// ETK 0.9.0.1: signature matched to the header -- upstream widened the
++	// real function to carry guest_width/guest_height but left this desktop
++	// stub on the old six-parameter form, which linked as a different
++	// overload and left the real symbol undefined.
++	bool capture_presented_frame(const vk::command_buffer&, const vk::render_device&, VkImage, VkImageLayout, u32, u32, u32, u32)
+ 	{
+ 		return false;
+ 	}
 diff --git a/rpcs3/Emu/RSX/VK/VKGSRender.cpp b/rpcs3/Emu/RSX/VK/VKGSRender.cpp
 index 85c6c7a94..9b0fc2788 100644
 --- a/rpcs3/Emu/RSX/VK/VKGSRender.cpp
