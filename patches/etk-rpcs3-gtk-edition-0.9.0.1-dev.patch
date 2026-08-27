@@ -1950,6 +1950,39 @@ index 52104cce3..721f1b128 100644
  	static const auto make_ptr = [](auto ptr)
  	{
  		return std::shared_ptr<std::remove_pointer_t<decltype(ptr)>>(ptr);
+diff --git a/rpcs3/Emu/system_config.h b/rpcs3/Emu/system_config.h
+index b057ce74e..8aa1dbc73 100644
+--- a/rpcs3/Emu/system_config.h
++++ b/rpcs3/Emu/system_config.h
+@@ -187,7 +187,13 @@ struct cfg_root : cfg::node
+ 		cfg::_bool disable_msl_fast_math{ this, "Disable MSL Fast Math", false };
+ 		cfg::_bool disable_async_host_memory_manager{ this, "Disable Asynchronous Memory Manager", false, true };
+ 		cfg::_enum<output_scaling_mode> output_scaling{ this, "Output Scaling Mode", output_scaling_mode::bilinear, true };
+-#ifdef __ANDROID__
++		// ETK 0.9.0.1: this block and shader_preset_path below were #ifdef
++		// __ANDROID__, but desktop TUs reference the members UNGATED
++		// (vkutils/swapchain.cpp x4; upscalers/librashader_pass.h via
++		// VKPresent.cpp) -- the desktop build did not compile. Declared
++		// unconditionally instead: the defaults (off / empty) keep desktop
++		// behaviour identical, and the FrameGen backend itself stays
++		// Android-only (see Emu/CMakeLists.txt + VKFrameGen.cpp's stubs).
+ 		// ARMSX3: Lossless Scaling frame generation.
+ 		//
+ 		// Default off and it stays off unless the user supplies shaders from their own copy of
+@@ -218,13 +224,10 @@ struct cfg_root : cfg::node
+ 		// are THS's property -- so the interpolation shaders are read out of a legitimately
+ 		// purchased copy. Kept here so the shader cache can be rebuilt without asking again.
+ 		cfg::string frame_generation_dll_path{ this, "Frame Generation Lossless Path", "", true };
+-#endif
+-#ifdef __ANDROID__
+ 		// ARMSX3: absolute path to a RetroArch .slangp preset, used when
+ 		// Output Scaling Mode is "Shader chain (librashader)". Empty = no chain,
+ 		// which falls back to a plain blit rather than failing to present.
+ 		cfg::string shader_preset_path{ this, "Shader Preset Path", "", true };
+-#endif
+ 		cfg::_bool record_with_overlays{ this, "Record With Overlays", true, true };
+ 		cfg::_bool disable_hardware_texel_remapping{ this, "Disable Hardware ColorSpace Remapping", false, true };
+ 		cfg::uint<0, 100> rcas_sharpening_intensity{ this, "FidelityFX CAS Sharpening Intensity", 50, true };
 diff --git a/rpcs3/rpcs3.cpp b/rpcs3/rpcs3.cpp
 index c3af28578..da08e7332 100644
 --- a/rpcs3/rpcs3.cpp
