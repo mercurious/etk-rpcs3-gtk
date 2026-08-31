@@ -2076,7 +2076,7 @@ index d33c786f7..f0dc1df7b 100644
 +		// base ARMSX2/ARMSX3@a74a0f3e0 (134 commits over the 0.9.0 GA base
 +		// f707458b0, gate evidence LeapfrogGate_N3_20260820); 0.9.0's ISO
 +		// commit dropped as superseded by upstream 2f0c63ac1.
-+		fmt::append(version, " | GTK Edition v0.9.0.2 (armsx3-a74a0f3e0)");
++		fmt::append(version, " | GTK Edition v0.9.0.3 (armsx3-a74a0f3e0)");
  		if (is_local_build())
  		{
  			fmt::append(version, " | local_build");
