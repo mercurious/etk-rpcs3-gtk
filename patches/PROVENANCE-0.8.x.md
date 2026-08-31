@@ -19,6 +19,22 @@ be identified from its contents alone — no reliance on filenames or branch nam
 0.8.2 are byte-identical in size because 0.8.2 is *the same source rebuilt on the LLVM-22
 toolchain* (see `etk.conf`), which this table independently confirms.
 
+## Addendum — `overlay-coalesce-notice.patch` (2026-08-31, Asahi surface)
+
+A base-independent fix to the fence rescue-notice code added in the 0.6.1-ffs series (present
+in every 0.8.x and 0.9.x patch). The **"GTK Crash Recovery"** overlay was queued from two fence
+paths per stall — the warn in `etk_fence_note_not_ready` and the resolution in
+`etk_fence_note_signaled` — with no coalescing, so a single GPU stall stacked two overlapping
+overlays. First observed on **Honeykrisp (Apple M1 / Asahi)**, 2026-08-31; see
+[rpcs3-asahi-M1](https://github.com/mercurious/rpcs3-asahi-M1).
+
+It touches only `etk_queue_rescue_notice` in `vkutils/sync.cpp` (a 13-line insertion, **0 marker
+changes**), so it applies cleanly on top of any cumulative carrying the fence-force net —
+verified atop `0.8.4-dev` on upstream `c6e96729c` (19895). **Not yet a numbered cumulative:** it
+carries no commit hash or literal bump. Fold it into the next cumulative at the next core
+revision (bump the `GTK Edition v` literal + cut the patch, per the runbook below); until then,
+apply it *after* the chosen `0.8.x-dev` patch. The 0.9.x / ARMSX3 line wants the same fix.
+
 ## Why this had to be recovered — two naming failures
 
 **1. Branch-name drift.** The branch `etk/0.8.0-19638` has tip `884836af9`, which is

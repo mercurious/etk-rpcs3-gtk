@@ -1,0 +1,24 @@
+diff --git a/rpcs3/Emu/RSX/VK/vkutils/sync.cpp b/rpcs3/Emu/RSX/VK/vkutils/sync.cpp
+index c03ad57..9acb0d5 100644
+--- a/rpcs3/Emu/RSX/VK/vkutils/sync.cpp
++++ b/rpcs3/Emu/RSX/VK/vkutils/sync.cpp
+@@ -631,6 +631,19 @@ namespace vk
+ 
+ 	static void etk_queue_rescue_notice(const char* text, u64 expiration_us)
+ 	{
++		// ETK: coalesce recovery notices — one visible overlay per stall episode.
++		// The warn (etk_fence_note_not_ready) and the resolution (force-signal, or
++		// etk_fence_note_signaled kernel-survive) are two paths for ONE stall;
++		// without this guard they stack as duplicate "GTK Crash Recovery" overlays
++		// (observed on Honeykrisp/Asahi 2026-08-31). Refresh the window, don't restack.
++		static atomic_t<u64> s_notice_until_us = 0;
++		const u64 now = etk_steady_now_us();
++		const u64 until = s_notice_until_us;
++		if (now < until)
++		{
++			return; // a recovery notice is already on screen
++		}
++		s_notice_until_us.release(now + expiration_us);
+ 		rsx::overlays::queue_message(std::string(text), expiration_us);
+ 	}
+ 
