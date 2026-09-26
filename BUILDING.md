@@ -339,10 +339,17 @@ missing; that line in RPCS3.log means STOP). Build the image with
 `scripts/build-image-etk.sh` (clones RPCS3/rpcs3-docker, injects the patch
 from rpcs3-docker-overlay/, tags etk-rpcs3-jammy-aarch64:llvm22).
 
-Then as before, with the new pin:
+Then as before, with the pin for the patch you are building:
 
-    git remote add armsx3 https://github.com/ARMSX2/ARMSX3.git && git fetch armsx3
-    git checkout f707458b0
-    git apply patches/etk-rpcs3-gtk-edition-0.9.0.patch
+    git remote add armsx3 https://github.com/ARMSX2/ARMSX3.git && git fetch armsx3 --tags
+    git checkout 8290349e5        # ARMSX3 tag 1.0.4 — base of 0.9.1-dev
+    git apply patches/etk-rpcs3-gtk-edition-0.9.1-dev.patch
 
-Forge lane knobs: FORGE_RPCS3_BASE=f707458b0, MARKER=rpcs3_perf_stat.
+| patch | base |
+|---|---|
+| `0.9.1-dev` | `8290349e5` (ARMSX3 1.0.4) |
+| `0.9.0.1-dev` … `0.9.0.3-dev` | `a74a0f3e0` |
+| `0.9.0` | `f707458b0` |
+
+Forge lane knobs: FORGE_RPCS3_BASE=8290349e5, MARKER=rpcs3_perf_stat. A base bump needs the
+build node's `~/rpcs3` to fetch the `armsx3` remote first — the lane does no fetch.

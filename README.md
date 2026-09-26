@@ -51,11 +51,25 @@ hardware data points.
 
 > **Downstream patch series — since 0.9.0 over [ARMSX3](https://github.com/ARMSX2/ARMSX3)
 > (the ARM64-focused RPCS3 fork, itself tracking RPCS3 upstream), previously over RPCS3
-> directly.** Current base: commit **`a74a0f3e0`** (ARMSX2/ARMSX3 `master`, 2026-08-24).
-> The 0.8.x line's base was **`a1deb2921`** (github.com/RPCS3/rpcs3 `master`, build
-> `v0.0.41-19638`). Upstream is the canonical source; this repository carries the delta as
+> directly.** Current base: commit **`8290349e5`** (ARMSX2/ARMSX3 tag `1.0.4`, 2026-09-26).
+> The 0.9.0.x line's base was **`a74a0f3e0`** (ARMSX3 `master`, 2026-08-24); the 0.8.x
+> line's base was **`a1deb2921`** (github.com/RPCS3/rpcs3 `master`, build `v0.0.41-19638`). Upstream is the canonical source; this repository carries the delta as
 > a single reviewed cumulative patch per release:
-> - `patches/etk-rpcs3-gtk-edition-0.9.0.1-dev.patch` — **current** dev cumulative on base
+> - `patches/etk-rpcs3-gtk-edition-0.9.1-dev.patch` — **current** dev cumulative on base
+>   **`8290349e5`** (ARMSX3 Release 1.0.4): the 0.9.0.3 set rebased across 692 commits.
+>   Two conflicts (semapark beside the base's new semaphore diagnostics; the fence
+>   drive-through merged into the base's new interruptible 1 s-slice wait — flag off =
+>   stock base). One clean-but-wrong merge fixed: the base's own device-lost path
+>   (`rsx::request_device_lost_shutdown`) now also sets the tguard latch, or a GPU hang
+>   would leave headless RPCS3 idling instead of exiting to the frontend. Plus a Linux
+>   include-case fix. Record, sweeps and gate notes: `patches/PROVENANCE-0.9.1.md`.
+> - `patches/etk-rpcs3-gtk-edition-0.9.0.3-dev.patch` — 0.9.0.2 plus
+>   `overlay-coalesce-notice.patch` (one "GTK Crash Recovery" overlay per stall, not two),
+>   base `a74a0f3e0`. The certified core at the 0.9.1 cut (`install.sh` `CERT_RPCS3`).
+> - `patches/etk-rpcs3-gtk-edition-0.9.0.2-dev.patch` — 0.9.0.1 minus the
+>   `stop_and_signal` `optnone` mask: upstream `a7ec28f7a` (in the base) fixes the SPU
+>   ordering bug at the root; Spec II A/B N=6 clean, median fps ~20 → ~23.
+> - `patches/etk-rpcs3-gtk-edition-0.9.0.1-dev.patch` — dev cumulative on base
 >   **`a74a0f3e0`**: the 0.9.0 set rebased across 134 upstream commits (one conflict:
 >   cellAudio telemetry vs upstream's `note_untouched()` baseline decay — both kept).
 >   0.9.0's ISO-reader commit is DROPPED as superseded: upstream `2f0c63ac1` restores the
