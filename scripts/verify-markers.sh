@@ -46,6 +46,7 @@ MARKERS=(
     "GTK_AV_READAHEAD|0.7.4|access-violation readahead"
     "GTK Crash Recovery|0.7.5|player-facing rescue overlay text"
     "GTK Edition|0.7.2|build self-identification"
+    "drop=%llu|0.9.1.1|cellAudio whole-block drop counter -> rpcs3_audio_stat"
 )
 
 # Markers that must ALSO survive into the shipped binary (literal strings in the

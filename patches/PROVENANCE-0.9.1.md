@@ -3,11 +3,14 @@
 `etk-rpcs3-gtk-edition-0.9.1-dev.patch` = `git diff 8290349e5..<tree>` — a cumulative diff
 on **`ARMSX2/ARMSX3` @ `8290349e5`** (tag `1.0.4`, "Release 1.0.4", 2026-09-26). Apply exactly
 one. Self-identifies as `GTK Edition v0.9.1 (armsx3-8290349e5)`.
+`etk-rpcs3-gtk-edition-0.9.1.1-dev.patch` is the same base plus the audio drop counter
+(addendum below). It self-identifies as `GTK Edition v0.9.1.1 (armsx3-8290349e5)`.
 
 | | base | commits over previous base | ETK delta |
 |---|---|---|---|
 | 0.9.0.3-dev | `a74a0f3e0` (2026-08-24) | — | 35 files, 1324+/50− |
-| **0.9.1-dev** | **`8290349e5`** (2026-09-26) | **692** | 35 files, 1326+/53− |
+| 0.9.1-dev | `8290349e5` (2026-09-26) | **692** | 35 files, 1326+/53− |
+| **0.9.1.1-dev** | **`8290349e5`** | 0 (same base) | 35 files, 1335+/53− |
 
 ## What the base moved
 
@@ -99,6 +102,14 @@ in the forge lane is the exhaustive check.
   `nv406e.cpp`, `vkutils/sync.cpp`, `RSXThread.cpp` clean. `VKPresent.cpp` not checked
   here (needs ffmpeg headers); its change is a deletion of an unreachable branch.
 - Not compiled or linked end-to-end: that is the forge lane.
+- **Minted clean — forge run `20260926-161125` (etk-cloud, 2026-09-26).** `8290349e5` +
+  this patch compiled and linked with no build fixes; the packaged AppImage passes VERIFY
+  without system ffmpeg; `verify-markers` 13/13 in the patch and 12/12 in the built ELF
+  (`is_device_lost` is a symbol, patch-only by design); the ELF carries
+  `GTK Edition v0.9.1 (armsx3-8290349e5)`; LANE OK, release_sanity PASS. Artifact
+  `rpcs3-etk_gtk-edition-0.9.1_armsx3-8290349e5_linux_aarch64.AppImage`, 80,446,399 B,
+  sha256 `98966af6a1ebe6ad98434f0757851e1154e5a07650e7bbb227dea2ea19e6a7d9` (local copy in
+  `~/etk/emulators/` matches the node). Staged for testing only; the rig gate is still ahead.
 - Build node `~/rpcs3` resting state = 0.9.0.3 v2 content exactly (the published
   0.9.0.3 patch carries a stale `rpcs3_version.cpp` index hash from the hand-edited
   literal bump in `e1398af`; content identical). The preflight reset is safe.
@@ -117,7 +128,66 @@ LV2 PPU-thread start sequencing (`c82e59895`…`77cb9423d`, timing-sensitive, da
 1. **Audio drop counter → telemetry.** Export `m_dropped_blocks` into
    `rpcs3_audio_stat` so the ledger can see the class of click the 60 ms headroom
    targets. New field = a parser change on the ETK side; not folded into this rebase.
+   **Resolved by 0.9.1.1-dev** (2026-09-26) — see the addendum below.
 2. **VK data-heap cap.** Widen the Android-only 256 MB ring ceiling to
    `ETK_CONSTRAINED_HOST`? Only on evidence of heap-growth failure on the rig.
 3. **`-nofbl` shader-cache tag** is Android-only; DRIVER-tab Turnip swaps that toggle
    feedback-loop support would share a cache on the rig. Watch, don't pre-empt.
+
+## Addendum — `audio-drop-counter.patch` (2026-09-26, open question 1)
+
+Appends one key to the aud1 line: `... enq_ms=%.1f buf_ms=%u drop=%llu`. Every earlier key
+keeps its name, position and meaning; the new key goes last so positional and `k=v` readers
+alike are unaffected.
+
+`drop` counts the same event as the base's `m_dropped_blocks` (the `push() != want` branch
+in `audio_ringbuffer::commit_data`), but from ETK's own `s_etk_aud.dropped_blocks`, and not
+by reading the member. `m_dropped_blocks` lives on the ringbuffer, which
+`cell_audio_thread::update_config()` destroys and rebuilds mid-session (config update,
+default-device change, and the not-operational backend retry every 128 loops), so reading
+it would silently zero the count. The ETK counter resets only at cellAudio thread start,
+like `ur`/`skip`/`sil`, so a cell stays "per guest boot". It is a plain `u64` because all
+`commit_data` paths (`enqueue`, `advance` → `process_resampled_data`) run on the cellAudio
+thread, as the dump does. The base's every-64 warning is untouched.
+
+Increments over `0.9.1-dev`: 1 file, 9+/2− (cumulative 1326+ → 1333+); **0 marker
+changes** (13/13, hit counts identical). The worst-case line, with every integer field at
+`u64` max, is 218 bytes against the 256-byte buffer, so it cannot truncate. Verified
+2026-09-26: base + `0.9.1-dev` + this diff equals a direct cumulative byte for byte; that
+cumulative passes `git apply --check` and `-R --check` on a clean `8290349e5`;
+`clang++ 22.1.8 -std=c++23 -fsyntax-only -Wformat=2` on `cellAudio.cpp` is clean, and a
+mutant missing the new argument is flagged.
+
+ETK side (mercurious/etk): `tools/etk_dyno.py --audio` gains DROP/min p50 + DROP N (a cell
+without `drop=` is unknown, never 0); `tools/test_audio_stat.py` runs both line formats
+through the real postmortem aud block and the dyno. `ETK_AUDIO_PRODUCER=<a patch or
+cellAudio.cpp>` pins its fixture to the producer. Landed first, as mercurious/etk `9b67632`:
+it is host-side only and reads old ledgers unchanged.
+
+**Cut as `etk-rpcs3-gtk-edition-0.9.1.1-dev.patch` (2026-09-26)**, self-identifying as
+`GTK Edition v0.9.1.1 (armsx3-8290349e5)`. It was not folded into `0.9.1-dev`: 0.9.1 was
+minted from the patch at sha256 `ddfb163ba9f1cebb…` (run `20260926-161125`; see
+Verification), and a fold would leave that binary disagreeing with its published patch, the
+same identity rot as the 0.9.0.3 v1 incident. `0.9.1-dev` stays final at `92b809a`.
+
+0.9.1.1-dev differs from 0.9.1-dev in exactly two files. `cellAudio.cpp` carries this
+addendum's diff. `rpcs3_version.cpp` gets the literal bump plus two comment lines above it.
+The cumulative was generated with `git diff --abbrev=9 8290349e5`, never hand-edited.
+`scripts/verify-markers.sh` gains `drop=%llu` (since 0.9.1.1). Verified 2026-09-26:
+- A fresh clean `8290349e5` clone passes `git apply --check`; after applying, `git diff`
+  regenerates the patch byte for byte, and `git apply -R --check` passes.
+- verify-markers passes 14/14 on 0.9.1.1-dev.
+- `clang++ 22.1.8 -O2 -c` compiles `cellAudio.cpp` and `rpcs3_version.cpp` (the latter with
+  a stub `git-version.h`). `strings -a` on the objects finds `drop=%llu` and
+  `GTK Edition v0.9.1.1 (armsx3-8290349e5)`, so the lane's binary gate will see both.
+- The ETK producer pin passes against the new patch.
+
+Under the new marker list, **0.9.1-dev MISSes `drop=%llu`**, as the list's "every later
+patch" rule intends. So re-minting 0.9.1 would need `verify-markers.sh` from `92b809a`.
+`audio-drop-counter.patch` stays as the reviewable delta, as `overlay-coalesce-notice.patch`
+did; apply exactly one cumulative.
+
+**Minting 0.9.1.1 is a separate, operator-gated step.** `~/etk/emulators/` already holds the
+two-core cap (0.9.0.3 CERT + 0.9.1), so one core must be retired first (0.9.1, never the
+CERT) or release_sanity fails. `FORGE_RPCS3_*` in `etk.conf` also needs repointing to the
+0.9.1.1 patch and artifact name.

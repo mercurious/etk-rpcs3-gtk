@@ -1,0 +1,49 @@
+diff --git a/rpcs3/Emu/Cell/Modules/cellAudio.cpp b/rpcs3/Emu/Cell/Modules/cellAudio.cpp
+index 8719808d7..2f93dfcfa 100644
+--- a/rpcs3/Emu/Cell/Modules/cellAudio.cpp
++++ b/rpcs3/Emu/Cell/Modules/cellAudio.cpp
+@@ -30,6 +30,7 @@ struct etk_audio_stats_t
+ 	atomic_t<u64> underrun_bytes{0};  // total shortfall bytes (silence-filled downstream)
+ 	u64 skipped_periods = 0;          // cellAudio advanced past untouched buffers (game fell behind)
+ 	u64 silence_periods = 0;          // fully-untouched periods enqueued as silence
++	u64 dropped_blocks = 0;           // whole blocks commit_data could not fit into the ring (cellAudio thread)
+ 	f32 ratio_min = 1.0f;             // lowest time-stretch frequency ratio since start
+ 	u64 start_us = 0;                 // emu clock at reset
+ };
+@@ -40,14 +41,15 @@ static void etk_audio_stats_dump(u64 timestamp_us, f32 cur_ratio, u64 enqueued_p
+ #ifdef __linux__
+ 	char line[256];
+ 	const int n = std::snprintf(line, sizeof(line),
+-		"up_s=%.1f ur=%llu urb=%llu skip=%llu sil=%llu ratio=%.3f rmin=%.3f enq_ms=%.1f buf_ms=%u\n",
++		"up_s=%.1f ur=%llu urb=%llu skip=%llu sil=%llu ratio=%.3f rmin=%.3f enq_ms=%.1f buf_ms=%u drop=%llu\n",
+ 		(timestamp_us - s_etk_aud.start_us) / 1'000'000.0,
+ 		static_cast<unsigned long long>(s_etk_aud.underrun_events.load()),
+ 		static_cast<unsigned long long>(s_etk_aud.underrun_bytes.load()),
+ 		static_cast<unsigned long long>(s_etk_aud.skipped_periods),
+ 		static_cast<unsigned long long>(s_etk_aud.silence_periods),
+ 		cur_ratio, s_etk_aud.ratio_min,
+-		enqueued_playtime_us / 1000.0, buf_ms);
++		enqueued_playtime_us / 1000.0, buf_ms,
++		static_cast<unsigned long long>(s_etk_aud.dropped_blocks));
+ 	if (n <= 0) return;
+ 
+ 	// Snapshot: latest values, atomically swapped (ETK ledger reads this at post-mortem)
+@@ -408,6 +410,10 @@ void audio_ringbuffer::commit_data(f32* buf, u32 sample_cnt)
+ 
+ 	if (cb_ringbuf.push(buf, want) != want)
+ 	{
++		// ETK aud1: m_dropped_blocks dies with the ringbuffer (update_config rebuilds it on a
++		// device change or backend retry); this one is per guest boot, like the counters above.
++		s_etk_aud.dropped_blocks++;
++
+ 		if ((m_dropped_blocks++ & 0x3f) == 0)
+ 		{
+ 			cellAudio.warning("Audio: dropped %u blocks that did not fit the ring (%.1f ms queued)",
+@@ -916,6 +922,7 @@ void cell_audio_thread::operator()()
+ 	s_etk_aud.underrun_bytes = 0;
+ 	s_etk_aud.skipped_periods = 0;
+ 	s_etk_aud.silence_periods = 0;
++	s_etk_aud.dropped_blocks = 0;
+ 	s_etk_aud.ratio_min = 1.0f;
+ 	s_etk_aud.start_us = get_system_time();
+ 	u64 etk_last_dump_us = 0;

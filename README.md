@@ -55,14 +55,21 @@ hardware data points.
 > The 0.9.0.x line's base was **`a74a0f3e0`** (ARMSX3 `master`, 2026-08-24); the 0.8.x
 > line's base was **`a1deb2921`** (github.com/RPCS3/rpcs3 `master`, build `v0.0.41-19638`). Upstream is the canonical source; this repository carries the delta as
 > a single reviewed cumulative patch per release:
-> - `patches/etk-rpcs3-gtk-edition-0.9.1-dev.patch` — **current** dev cumulative on base
+> - `patches/etk-rpcs3-gtk-edition-0.9.1.1-dev.patch` — **current** dev cumulative on base
+>   **`8290349e5`**: 0.9.1 plus a `drop=` key on the `/dev/shm/rpcs3_audio_stat` line, the
+>   count of whole 5.33 ms audio blocks discarded because they did not fit the ring (ARMSX3
+>   `14e740513`'s counter, kept per guest boot). Those clicks happen with zero underruns and
+>   were invisible to the ETK ledger. Every existing field is unchanged. Record:
+>   `patches/PROVENANCE-0.9.1.md` (addendum).
+> - `patches/etk-rpcs3-gtk-edition-0.9.1-dev.patch` — dev cumulative on base
 >   **`8290349e5`** (ARMSX3 Release 1.0.4): the 0.9.0.3 set rebased across 692 commits.
 >   Two conflicts (semapark beside the base's new semaphore diagnostics; the fence
 >   drive-through merged into the base's new interruptible 1 s-slice wait — flag off =
 >   stock base). One clean-but-wrong merge fixed: the base's own device-lost path
 >   (`rsx::request_device_lost_shutdown`) now also sets the tguard latch, or a GPU hang
 >   would leave headless RPCS3 idling instead of exiting to the frontend. Plus a Linux
->   include-case fix. Record, sweeps and gate notes: `patches/PROVENANCE-0.9.1.md`.
+>   include-case fix. Minted clean 2026-09-26 (forge run `20260926-161125`). Record, sweeps
+>   and gate notes: `patches/PROVENANCE-0.9.1.md`.
 > - `patches/etk-rpcs3-gtk-edition-0.9.0.3-dev.patch` — 0.9.0.2 plus
 >   `overlay-coalesce-notice.patch` (one "GTK Crash Recovery" overlay per stall, not two),
 >   base `a74a0f3e0`. The certified core at the 0.9.1 cut (`install.sh` `CERT_RPCS3`).
