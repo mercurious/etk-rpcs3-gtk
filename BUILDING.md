@@ -342,12 +342,12 @@ from rpcs3-docker-overlay/, tags etk-rpcs3-jammy-aarch64:llvm22).
 Then as before, with the pin for the patch you are building:
 
     git remote add armsx3 https://github.com/ARMSX2/ARMSX3.git && git fetch armsx3 --tags
-    git checkout 8290349e5        # ARMSX3 tag 1.0.4 — base of 0.9.1-dev and 0.9.1.1-dev
-    git apply patches/etk-rpcs3-gtk-edition-0.9.1.1-dev.patch
+    git checkout 8290349e5        # ARMSX3 tag 1.0.4 — base of 0.9.1-dev … 0.9.1.2-dev
+    git apply patches/etk-rpcs3-gtk-edition-0.9.1.2-dev.patch
 
 | patch | base |
 |---|---|
-| `0.9.1-dev`, `0.9.1.1-dev` | `8290349e5` (ARMSX3 1.0.4) |
+| `0.9.1-dev`, `0.9.1.1-dev`, `0.9.1.2-dev` | `8290349e5` (ARMSX3 1.0.4) |
 | `0.9.0.1-dev` … `0.9.0.3-dev` | `a74a0f3e0` |
 | `0.9.0` | `f707458b0` |
 

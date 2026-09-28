@@ -1,0 +1,23 @@
+diff --git a/rpcs3/Emu/RSX/VK/VKResolveHelper.cpp b/rpcs3/Emu/RSX/VK/VKResolveHelper.cpp
+index 74a7752cc..0a986b227 100644
+--- a/rpcs3/Emu/RSX/VK/VKResolveHelper.cpp
++++ b/rpcs3/Emu/RSX/VK/VKResolveHelper.cpp
+@@ -457,6 +457,18 @@ namespace vk
+ 			g_gfx_shuffle.reset();
+ 		}
+ 
++		// ETK: the 32-bit twin (85b7495b9) was never torn down here. Once a session had run a
++		// 32-bit byteswap on the graphics pipe, the pass -- and its overlays UBO (8 MiB) and VAO
++		// (1 MiB) heaps -- outlived the device: "Leaking memory allocations" at teardown, then its
++		// static destructor called vkDestroyBuffer on the destroyed VkDevice, the loader aborted
++		// ("Invalid device"), and the kernel wrote a multi-GB core to the SD card while the rig
++		// sat on a frozen screen for up to 74 minutes after every such graceful exit.
++		if (g_gfx_shuffle_32)
++		{
++			g_gfx_shuffle_32->destroy();
++			g_gfx_shuffle_32.reset();
++		}
++
+ 		for (auto &task : g_resolve_helpers)
+ 		{
+ 			task.second->destroy();

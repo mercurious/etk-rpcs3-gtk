@@ -47,11 +47,15 @@ MARKERS=(
     "GTK Crash Recovery|0.7.5|player-facing rescue overlay text"
     "GTK Edition|0.7.2|build self-identification"
     "drop=%llu|0.9.1.1|cellAudio whole-block drop counter -> rpcs3_audio_stat"
+    "g_gfx_shuffle_32->destroy()|0.9.1.2|32-bit gfx byteswap pass torn down with the device (exit abort)"
 )
 
 # Markers that must ALSO survive into the shipped binary (literal strings in the
-# code). is_device_lost is a symbol, not a string, so it is patch-only.
-BINARY_EXEMPT="is_device_lost"
+# code). Patch-only markers name code, not strings: is_device_lost is a symbol,
+# g_gfx_shuffle_32->destroy() a teardown call. Space-separated: this is matched
+# as a list below, because a `|` that comes out of a variable expansion is a
+# literal character in a case pattern, not an alternative.
+BINARY_EXEMPT="is_device_lost g_gfx_shuffle_32->destroy()"
 
 # An explicitly declared baseline may waive the feature gate. The declaration
 # lives IN the patch file (committed, visible, greppable) -- never in an env
@@ -106,7 +110,7 @@ if [ -n "$BIN" ]; then
     echo "== markers in $(basename "$BIN") =="
     for entry in "${MARKERS[@]}"; do
         IFS='|' read -r marker since desc <<< "$entry"
-        case "$marker" in $BINARY_EXEMPT) continue ;; esac
+        case " $BINARY_EXEMPT " in *" $marker "*) continue ;; esac
         # NB: no `grep -q` here. Under `set -o pipefail`, grep -q exits at the
         # first match, strings dies of SIGPIPE, and pipefail turns that into a
         # failed pipeline — every marker would report a false MISS. Count

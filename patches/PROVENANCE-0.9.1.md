@@ -5,12 +5,15 @@ on **`ARMSX2/ARMSX3` @ `8290349e5`** (tag `1.0.4`, "Release 1.0.4", 2026-09-26).
 one. Self-identifies as `GTK Edition v0.9.1 (armsx3-8290349e5)`.
 `etk-rpcs3-gtk-edition-0.9.1.1-dev.patch` is the same base plus the audio drop counter
 (addendum below). It self-identifies as `GTK Edition v0.9.1.1 (armsx3-8290349e5)`.
+`etk-rpcs3-gtk-edition-0.9.1.2-dev.patch` is 0.9.1.1 plus the exit-teardown fix (second
+addendum). It self-identifies as `GTK Edition v0.9.1.2 (armsx3-8290349e5)`.
 
 | | base | commits over previous base | ETK delta |
 |---|---|---|---|
 | 0.9.0.3-dev | `a74a0f3e0` (2026-08-24) | — | 35 files, 1324+/50− |
 | 0.9.1-dev | `8290349e5` (2026-09-26) | **692** | 35 files, 1326+/53− |
-| **0.9.1.1-dev** | **`8290349e5`** | 0 (same base) | 35 files, 1335+/53− |
+| 0.9.1.1-dev | `8290349e5` | 0 (same base) | 35 files, 1335+/53− |
+| **0.9.1.2-dev** | **`8290349e5`** | 0 (same base) | 36 files, 1349+/53− |
 
 ## What the base moved
 
@@ -191,3 +194,53 @@ did; apply exactly one cumulative.
 two-core cap (0.9.0.3 CERT + 0.9.1), so one core must be retired first (0.9.1, never the
 CERT) or release_sanity fails. `FORGE_RPCS3_*` in `etk.conf` also needs repointing to the
 0.9.1.1 patch and artifact name.
+
+## Addendum 2 — `gfx-shuffle32-teardown.patch` (2026-09-27, the 0.9.1 exit hang)
+
+**Symptom (rig, ETK ledger).** On 0.9.1 the emulator wrote its complete graceful-shutdown log
+(last line `gui_application: Deleting old game window`) and then the process stayed: 5 of 6
+archived exits sat 9 s, 35 s, 79 s, 82 s and 74 min before an L1+R3 or a reboot, across GT5P
+Spec III (.pkg), the GT5P disc (.iso) and GT HD. On 0.9.0.x the process was gone 0.5–4.6 s
+after that line (N=30 archived exits).
+
+**Mechanism (captured live on BCUS98158 by the ETK spotter's EXIT-HANG class).** One thread
+left, uninterruptible, kernel stack `get_signal → vfs_coredump → elf_core_dump →
+dump_user_range → ext4 write → balance_dirty_pages`: the process had taken SIGABRT and the
+kernel was writing its core (`AppRun.wrapped.<pid>.6.core`, 1.3 GB when R3 cut it; the 13:55
+GT5P session left a `.6` core too) to the SD card. The emulator's last stderr line:
+`[Vulkan Loader] ERROR: vkDestroyBuffer: Invalid device [VUID-vkDestroyBuffer-device-parameter]`.
+
+**Cause.** `85b7495b9` ("vk: run the 32-bit byteswap on the graphics pipe", 2026-09-11) added
+a second global pass, `g_gfx_shuffle_32`, beside `g_gfx_shuffle`, but `clear_resolve_helpers()`
+tears down only the first. The pass is Qualcomm-gated (`b36ab66d5`), so it exists only on
+Adreno/Turnip and only in sessions that ran a 32-bit byteswap. It then outlives the device:
+teardown logs `RSX: Leaking memory allocations!` for exactly its two heaps, the overlays UBO
+(`8 * 0x100000`) and VAO (`1 * 0x100000`) in `VMM_ALLOCATION_POOL_SYSTEM` (4 of the 5 hung
+exits carry that line; 0 of 31 clean exits across both cores do), and at process exit its static
+destructor frees a buffer on the dead device, which the loader answers with `abort()`.
+
+**Fix.** Destroy and reset `g_gfx_shuffle_32` in `clear_resolve_helpers()` exactly as its
+twin is. `clear_resolve_helpers()` runs in `destroy_global_resources()` while the device is
+alive; `reset()` runs the pass's destructor there, freeing both heaps in time. No runtime
+flag: this is a teardown that was missing, not a behaviour to A/B.
+
+**Verification (host, 2026-09-27).**
+- Fresh `8290349e5` clone: `git apply --check` OK → apply → `git diff --abbrev=9 8290349e5`
+  regenerates the patch **byte-identical** → `git apply -R --check` OK. The 0.9.1.1 cumulative
+  round-trips byte-identical on the same base; the two cumulatives differ in exactly
+  `VKResolveHelper.cpp` (this fix) and `rpcs3_version.cpp` (literal + two comment lines).
+- `clang++ 22.1.8 -std=c++23 -fsyntax-only` (`ETK_CONSTRAINED_HOST`, X11+Wayland) on
+  `VKResolveHelper.cpp`: clean. A mutant calling `destroyy()` fails the same check, so it is
+  not vacuous.
+- `scripts/verify-markers.sh`: 15/15 on 0.9.1.2-dev; 0.9.1.1-dev now MISSes
+  `g_gfx_shuffle_32->destroy()` as the "every later patch" rule intends. The marker is
+  patch-only (a call, not a string): `BINARY_EXEMPT` became a space-separated list, because
+  a `|` coming out of a variable expansion is literal in a `case` pattern. Binary half
+  re-checked against the 0.9.1.1 AppImage: both patch-only markers skipped, 13/13 found.
+- Not compiled or linked end to end: that is the forge lane.
+
+**What it does not claim.** The 74-minute case (session 1790536279) logged no leak line and
+no RSX teardown lines at all, so its abort may have a second owner; the rig's next EXIT-CRASH
+catch on 0.9.1.2 answers that. GT6/GT5 not reaching their menus on 0.9.1 is a separate,
+deterministic guest-level stall (loader thread in `_sys_lwmutex_lock`, RSX healthy) and is
+not addressed here.

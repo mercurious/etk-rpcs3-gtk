@@ -55,7 +55,14 @@ hardware data points.
 > The 0.9.0.x line's base was **`a74a0f3e0`** (ARMSX3 `master`, 2026-08-24); the 0.8.x
 > line's base was **`a1deb2921`** (github.com/RPCS3/rpcs3 `master`, build `v0.0.41-19638`). Upstream is the canonical source; this repository carries the delta as
 > a single reviewed cumulative patch per release:
-> - `patches/etk-rpcs3-gtk-edition-0.9.1.1-dev.patch` — **current** dev cumulative on base
+> - `patches/etk-rpcs3-gtk-edition-0.9.1.2-dev.patch` — **current** dev cumulative on base
+>   **`8290349e5`**: 0.9.1.1 plus one teardown fix. The base's 32-bit graphics-pipe byteswap
+>   pass (ARMSX3 `85b7495b9`, Qualcomm-gated) was never destroyed with the device, so any
+>   session that used it aborted *after* a clean exit (`vkDestroyBuffer: Invalid device`) and
+>   the kernel wrote a multi-GB core dump, leaving the screen frozen for seconds to over an
+>   hour. Reviewable delta: `patches/gfx-shuffle32-teardown.patch`. Record:
+>   `patches/PROVENANCE-0.9.1.md` (second addendum).
+> - `patches/etk-rpcs3-gtk-edition-0.9.1.1-dev.patch` — dev cumulative on base
 >   **`8290349e5`**: 0.9.1 plus a `drop=` key on the `/dev/shm/rpcs3_audio_stat` line, the
 >   count of whole 5.33 ms audio blocks discarded because they did not fit the ring (ARMSX3
 >   `14e740513`'s counter, kept per guest boot). Those clicks happen with zero underruns and
