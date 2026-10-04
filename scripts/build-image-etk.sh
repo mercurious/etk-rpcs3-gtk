@@ -15,17 +15,28 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 DOCKER_REPO=${DOCKER_REPO:-https://github.com/RPCS3/rpcs3-docker}
+# PINNED (2026-10-04, etk-cloud rebuild): the recipe used to clone rpcs3-docker
+# HEAD, so a rebuilt node would get whatever upstream had moved to — a new
+# LLVM/Qt/SDL under the same tag. f6dc38f9 (2026-08-09) is the HEAD the shipped
+# llvmspill image was built from on 2026-08-20 (rpcs3-docker had no commits
+# between the two). Bump deliberately, with STATIC_LLVM_VER checked against the
+# overlay patch's target.
+DOCKER_REF=${DOCKER_REF:-f6dc38f908056edef9d3a67a550cc29edf070d18}
 WORK=${WORK:-build-image}
 TAG=${TAG:-etk-rpcs3-jammy-aarch64:llvmspill-22.1.8}
 PATCH=rpcs3-docker-overlay/armsx3-aarch64-ghc-emergency-spill.patch
 
 [ -f "$PATCH" ] || { echo "FATAL: missing $PATCH" >&2; exit 1; }
 
-if [ -d "$WORK/rpcs3-docker/.git" ]; then
-    git -C "$WORK/rpcs3-docker" pull --ff-only
-else
-    mkdir -p "$WORK"
-    git -C "$WORK" clone --depth 1 "$DOCKER_REPO"
+if [ ! -d "$WORK/rpcs3-docker/.git" ]; then
+    mkdir -p "$WORK/rpcs3-docker"
+    git -C "$WORK/rpcs3-docker" init -q
+    git -C "$WORK/rpcs3-docker" remote add origin "$DOCKER_REPO"
+fi
+if [ "$(git -C "$WORK/rpcs3-docker" rev-parse -q --verify HEAD 2>/dev/null)" != "$DOCKER_REF" ]; then
+    # -f: a checkout at another ref carries our injected Dockerfile edit
+    git -C "$WORK/rpcs3-docker" fetch -q --depth 1 origin "$DOCKER_REF"
+    git -C "$WORK/rpcs3-docker" checkout -q -f --detach FETCH_HEAD
 fi
 
 CTX="$WORK/rpcs3-docker/jammy-aarch64"
@@ -68,9 +79,14 @@ EOF
 fi
 
 docker build -t "$TAG" "$CTX"
-# Keep existing BUILDING.md / mint invocations working unchanged:
-docker tag "$TAG" etk-rpcs3-jammy-aarch64:local
+# Keep existing BUILDING.md / mint invocations working unchanged — and tag the
+# name forge.sh actually asks for (FORGE_RPCS3_IMAGE). Until 2026-10-04 nothing
+# produced :llvm22; the 2026-08-20 build needed a hand override, so a fresh node
+# built from this script failed forge preflight with image-…-missing.
+for t in etk-rpcs3-jammy-aarch64:local etk-rpcs3-jammy-aarch64:llvm22; do
+    [ "$t" = "$TAG" ] || docker tag "$TAG" "$t"
+done
 
-echo "OK: built $TAG (and re-tagged etk-rpcs3-jammy-aarch64:local)"
+echo "OK: built $TAG @ rpcs3-docker ${DOCKER_REF:0:9} (tags :local and :llvm22 too)"
 echo "    LLVM 22.1.8 + AArch64 GHC emergency-spill fix in /opt/llvm"
 echo "    Sentinel (must NEVER appear in RPCS3.log): 'Retrying module .* allocator-friendly codegen'"

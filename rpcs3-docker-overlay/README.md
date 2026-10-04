@@ -27,7 +27,7 @@ So the fix is baked into the toolchain image instead: `scripts/build-image-etk.s
 upstream `RPCS3/rpcs3-docker`, injects a `patch -p1` step into the jammy-aarch64
 Dockerfile's LLVM build (anchored on the exact extract line; refuses to guess if upstream
 reshapes it; the image build fails loudly if the patch stops applying), builds
-`etk-rpcs3-jammy-aarch64:llvmspill-22.1.8`, and re-tags `:local` so existing mint
+`etk-rpcs3-jammy-aarch64:llvmspill-22.1.8` from rpcs3-docker pinned at `f6dc38f9`, and re-tags `:local` and `:llvm22` (forge's name) so existing mint
 invocations pick it up unchanged.
 
 ## Sentinel
