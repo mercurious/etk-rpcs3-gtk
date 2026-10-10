@@ -48,6 +48,10 @@ MARKERS=(
     "GTK Edition|0.7.2|build self-identification"
     "drop=%llu|0.9.1.1|cellAudio whole-block drop counter -> rpcs3_audio_stat"
     "g_gfx_shuffle_32->destroy()|0.9.1.2|32-bit gfx byteswap pass torn down with the device (exit abort)"
+    "GTK_PITLINK|0.10.0|GTK Pitlink -- the Engineer's link (eyes/hands/RAM/clock)"
+    "etk-pitlink|0.10.0|Pitlink abstract socket name (@etk-pitlink)"
+    "pitlink_record_tap|0.10.0|async frame tap at the flip -- no hard sync"
+    "m_socket_ino|0.10.0|PINE socket unlink-race fix (inode guard)"
 )
 
 # Markers that must ALSO survive into the shipped binary (literal strings in the
@@ -55,7 +59,7 @@ MARKERS=(
 # g_gfx_shuffle_32->destroy() a teardown call. Space-separated: this is matched
 # as a list below, because a `|` that comes out of a variable expansion is a
 # literal character in a case pattern, not an alternative.
-BINARY_EXEMPT="is_device_lost g_gfx_shuffle_32->destroy()"
+BINARY_EXEMPT="is_device_lost g_gfx_shuffle_32->destroy() pitlink_record_tap m_socket_ino"
 
 # An explicitly declared baseline may waive the feature gate. The declaration
 # lives IN the patch file (committed, visible, greppable) -- never in an env
