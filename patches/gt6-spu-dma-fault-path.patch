@@ -1,0 +1,102 @@
+diff --git a/rpcs3/Emu/Cell/SPUThread.cpp b/rpcs3/Emu/Cell/SPUThread.cpp
+index 98e0e1a1e..27e4dae4c 100644
+--- a/rpcs3/Emu/Cell/SPUThread.cpp
++++ b/rpcs3/Emu/Cell/SPUThread.cpp
+@@ -18,6 +18,7 @@
+ #include "Emu/Cell/lv2/sys_event_flag.h"
+ #include "Emu/Cell/lv2/sys_event.h"
+ #include "Emu/Cell/lv2/sys_interrupt.h"
++#include "Emu/Cell/lv2/sys_mmapper.h"
+ 
+ #include "Emu/Cell/SPUDisAsm.h"
+ #include "Emu/Cell/SPUAnalyser.h"
+@@ -2743,6 +2744,73 @@ struct ppu_watch_putll_report
+ };
+ 
+ 
++// Whether the access-violation handler would serve a fault on this transfer instead of killing the
++// thread: every byte that is not backed lies in an area the game armed with
++// sys_mmapper_enable_page_fault_notification. The handler posts such a fault to the game's queue,
++// the game maps the page and resumes the thread, and the copy completes. This is the same lookup
++// the handler does (Utilities/Thread.cpp): the vm block's base against the notification entries,
++// with a live port and queue, from a PPU or SPU thread.
++//
++// Gran Turismo 6 (BCUS98296) demand-maps a 256 MB arena this way (0x60000000 on the usual layout).
++// Its PPU threads fault into it all through boot, and PDICellSpursKernel0 PUTs 16 KB to 0x611d0000
++// while that page is still unmapped. The unbacked guard below dropped that PUT, the data never
++// landed, and GT6 read a null pointer at 0x00979c58 three seconds later (hunt-20261010-gt6,
++// m04-m13). Such an area can only start inside 0x20000000-0xC0000000
++// (sys_mmapper_enable_page_fault_notification refuses anything else), so none of Killzone 3's bad
++// addresses (main memory, and the SPU MMIO range) can match.
++static bool spu_dma_fault_is_served(u32 eal, u32 size, bool is_get)
++{
++	const auto cpu = get_current_cpu_thread();
++
++	if (!cpu || (cpu->get_class() != thread_class::ppu && cpu->get_class() != thread_class::spu))
++	{
++		return false;
++	}
++
++	auto& pf_entries = g_fxo->get<page_fault_notification_entries>();
++
++	const auto armed = [&](u32 addr)
++	{
++		const auto area = vm::get(vm::any, addr);
++
++		if (!area)
++		{
++			return false;
++		}
++
++		reader_lock lock(pf_entries.mutex);
++
++		for (const auto& entry : pf_entries.entries)
++		{
++			if (entry.start_addr == area->addr)
++			{
++				const auto port = idm::get_unlocked<lv2_obj, lv2_event_port>(entry.port_id);
++				return port && port->queue;
++			}
++		}
++
++		return false;
++	};
++
++	// Page by page (at most five for a 16 KB transfer): a page the copy can use is fine, any other
++	// page has to be one the handler would hand to the game.
++	const auto need = is_get ? vm::page_readable : vm::page_writable;
++	const u32 last = (eal + size - 1) & -4096;
++
++	for (u32 page = eal & -4096;; page += 4096)
++	{
++		if (!vm::check_addr(page, need) && !armed(page))
++		{
++			return false;
++		}
++
++		if (page == last)
++		{
++			return true;
++		}
++	}
++}
++
+ void spu_thread::do_dma_transfer(spu_thread* _this, const spu_mfc_cmd& args, u8* ls)
+ {
+ 	// Per DMA transfer; only the destructor reads it, and only under perf_report.
+@@ -3054,9 +3122,14 @@ void spu_thread::do_dma_transfer(spu_thread* _this, const spu_mfc_cmd& args, u8*
+ 		const bool raw_spu_ls = eal >= RAW_SPU_BASE_ADDR && eal < SYS_SPU_THREAD_BASE_LOW &&
+ 			(eal - RAW_SPU_BASE_ADDR) % RAW_SPU_OFFSET + args.size - 1 < SPU_LS_SIZE;
+ 
++		// A page in a demand-mapped area is not unbacked, only not mapped YET. The copy below faults
++		// on it, the handler hands the fault to the game's page-fault thread, and the thread resumes
++		// once the page is there -- which is what the MFC does on hardware too. Declining it instead
++		// dropped Gran Turismo 6's first PUT into such a page (see spu_dma_fault_is_served).
+ 		const bool unbacked = eal >= RAW_SPU_BASE_ADDR && !raw_spu_ls
+ 			? (is_get ? src == guest : dst == guest) // the MMIO block declined to redirect it
+-			: !vm::check_addr(eal, is_get ? vm::page_readable : vm::page_writable, args.size);
++			: !vm::check_addr(eal, is_get ? vm::page_readable : vm::page_writable, args.size) &&
++				!spu_dma_fault_is_served(eal, args.size, is_get);
+ 
+ 		if (unbacked) [[unlikely]]
+ 		{

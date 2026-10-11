@@ -10,6 +10,20 @@ October release it ships in (operator decision 2026-10-10), not as a 0.9.x patch
 | 0.9.1.2-dev | `8290349e5` | exit-teardown fix (see PROVENANCE-0.9.1.md) |
 | **0.10.0-dev** | **`8290349e5`** | 0.9.1.2 carried verbatim **+ GTK Pitlink + the PINE unlink-race fix** |
 
+## GT6 boot fixes (2026-10-11, folded in)
+
+`0.10.0-dev` now also carries the two Gran Turismo 6 (BCUS98296) boot fixes found by the first ETK hunts
+(`etk-dossiers/Hunt_GT6Bisect_20261010.md`). Each also ships as its own file for review:
+- **`gt6-sysutil-startup-mapping.patch`**: restores the sysutil startup shared-memory mapping from upstream #19467
+  WITHOUT its cellAudio half. ARMSX3 `e24761512` reverted all of #19467 (for Mortal Kombat KE's WB-logo hang). That
+  moved every `sys_mmapper` area 256 MB lower and deadlocked GT6 at boot (convicted by bisect, confirmed by m10).
+- **`gt6-spu-dma-fault-path.patch`**: the unbacked-DMA guard (ARMSX3 `a875e771f`, for Killzone 3) dropped an SPU PUT
+  to a page GT6 maps on demand, and GT6 read a null pointer 3 s later. Pages in an area armed for page-fault
+  notification now go to the fault path. KZ3's bad addresses can't match such an area.
+Validated: GT6 boots to My Home and races (car8 and car12, 2026-10-11). Not tested in the garage: Killzone 3
+and MK KE (not owned; the 0.10.0 notes ask the community). Known issue: a rare gcm user-interrupt race (null +
+0xc in GT6's handler at `0x00b7ba80`), see the hunt dossier.
+
 ## Why it exists
 
 The 2026-10-10 session tried to give an agent eyes and hands on a running GT5P using only what
