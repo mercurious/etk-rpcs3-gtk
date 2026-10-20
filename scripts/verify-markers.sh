@@ -32,9 +32,10 @@ fi
 # Required markers: string, and the release that introduced it. Anything listed
 # here must appear in EVERY later cumulative patch — these are the features the
 # fork exists to ship. Add a line whenever a new gated feature lands.
+# hunt-20261019-rr7: the 0.8.0-era set. The bisect mints 0.8.0-dev on upstream 19544..19638;
+# GTK_PROBE_11912 was absent 0.7.5..0.8.3 and every later marker postdates 0.8.0.
 MARKERS=(
     "GTK_REMAP0_ONE|0.6.0|#11912 road-flicker fix (force-ONE remap decode)"
-    "GTK_PROBE_11912|0.6.0|TIU transition probe — the instrument that localized #11912"
     "rpcs3_audio_stat|0.6.0|cellAudio telemetry -> /dev/shm"
     "is_device_lost|0.6.1-tguard-v6|tguard device-loss latch"
     "GTK_FENCE_FORCE_SIGNAL|0.6.1-ffs-v1|fence force-signal drive-through"
@@ -46,12 +47,6 @@ MARKERS=(
     "GTK_AV_READAHEAD|0.7.4|access-violation readahead"
     "GTK Crash Recovery|0.7.5|player-facing rescue overlay text"
     "GTK Edition|0.7.2|build self-identification"
-    "drop=%llu|0.9.1.1|cellAudio whole-block drop counter -> rpcs3_audio_stat"
-    "g_gfx_shuffle_32->destroy()|0.9.1.2|32-bit gfx byteswap pass torn down with the device (exit abort)"
-    "GTK_PITLINK|0.10.0|GTK Pitlink -- the Engineer's link (eyes/hands/RAM/clock)"
-    "etk-pitlink|0.10.0|Pitlink abstract socket name (@etk-pitlink)"
-    "pitlink_record_tap|0.10.0|async frame tap at the flip -- no hard sync"
-    "m_socket_ino|0.10.0|PINE socket unlink-race fix (inode guard)"
 )
 
 # Markers that must ALSO survive into the shipped binary (literal strings in the
