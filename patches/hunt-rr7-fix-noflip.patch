@@ -1,0 +1,5211 @@
+diff --git a/.ci/build-linux-aarch64.sh b/.ci/build-linux-aarch64.sh
+index 26fc1dc9d..8deebb33e 100755
+--- a/.ci/build-linux-aarch64.sh
++++ b/.ci/build-linux-aarch64.sh
+@@ -43,6 +43,7 @@ cmake ..                                               \
+     -DSTATIC_LINK_LLVM=ON                              \
+     -DBUILD_RPCS3_TESTS="${RUN_UNIT_TESTS}"            \
+     -DRUN_RPCS3_TESTS="${RUN_UNIT_TESTS}"              \
++    -DETK_CONSTRAINED_HOST=ON                          \
+     -G Ninja
+ 
+ ninja; build_status=$?;
+diff --git a/.ci/deploy-linux.sh b/.ci/deploy-linux.sh
+index 5a1610edd..0e5f1ab36 100755
+--- a/.ci/deploy-linux.sh
++++ b/.ci/deploy-linux.sh
+@@ -20,7 +20,7 @@ if [ "$DEPLOY_APPIMAGE" = "true" ]; then
+     APPIMAGE_EXTRACT_AND_RUN=1 linuxdeploy --appdir AppDir --plugin qt --plugin checkrt
+ 
+     # Restore App Icon
+-    ln -sr ./AppDir/rpcs3.svg ./AppDir/.DirIcon
++    ln -srf ./AppDir/rpcs3.svg ./AppDir/.DirIcon
+     
+     # Remove libwayland-client because it has platform-dependent exports and breaks other OSes
+     rm -f ./AppDir/usr/lib/libwayland-client.so*
+diff --git a/3rdparty/pine/pine_server.h b/3rdparty/pine/pine_server.h
+index 5c59e87da..7ef53c74c 100644
+--- a/3rdparty/pine/pine_server.h
++++ b/3rdparty/pine/pine_server.h
+@@ -33,6 +33,7 @@
+ #include <arpa/inet.h>
+ #include <poll.h>
+ #include <unistd.h>
++#include <sys/stat.h>
+ #endif
+ 
+ #ifdef _WIN32
+@@ -72,6 +73,10 @@ namespace pine
+ 		int m_sock = 0;
+ 		// the message socket used in thread's accept().
+ 		int m_msgsock = 0;
++		// ETK: identity of the socket FILE this server bound, so Cleanup() never unlinks a
++		// path that a newer server has re-bound (see Cleanup).
++		dev_t m_socket_dev = 0;
++		ino_t m_socket_ino = 0;
+ #endif
+ 
+ 		/**
+@@ -601,6 +606,13 @@ namespace pine
+ 				Impl::error("IPC: Error while binding to socket! Shutting down...");
+ 				return;
+ 			}
++
++			struct stat bound{};
++			if (stat(m_socket_name.c_str(), &bound) == 0)
++			{
++				m_socket_dev = bound.st_dev;
++				m_socket_ino = bound.st_ino;
++			}
+ #endif
+ 
+ 			// maximum queue of 4096 commands before refusing, approximated to the
+@@ -617,7 +629,16 @@ namespace pine
+ #ifdef _WIN32
+ 			WSACleanup();
+ #else
+-			unlink(m_socket_name.c_str());
++			// ETK: unlink only the socket file THIS server bound. Emulator::Init runs twice at a
++			// --no-gui boot, so a second IPC server binds the same path ~18 ms after the first;
++			// the first one's teardown then unlinked the second's live socket, which kept
++			// listening on a name nobody could reach (car8, 2026-10-10: no rpcs3.sock).
++			struct stat current{};
++			if (m_socket_ino && stat(m_socket_name.c_str(), &current) == 0 &&
++				current.st_dev == m_socket_dev && current.st_ino == m_socket_ino)
++			{
++				unlink(m_socket_name.c_str());
++			}
+ #endif
+ 			close_portable(m_sock);
+ 			close_portable(m_msgsock);
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 681afe8fe..22f5a0d2d 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -52,6 +52,10 @@ else()
+ endif()
+ 
+ option(USE_NATIVE_INSTRUCTIONS "USE_NATIVE_INSTRUCTIONS makes rpcs3 compile with -march=native, which is useful for local builds, but not good for packages." ON)
++option(ETK_CONSTRAINED_HOST "Enable the constrained-host tuning profile (mobile-class descriptor pool, query-wait backoff, RAM-budgeted PPU compile workers) on non-Android builds" OFF)
++if(ETK_CONSTRAINED_HOST)
++    add_compile_definitions(ETK_CONSTRAINED_HOST)
++endif()
+ option(WITH_LLVM "Enable usage of LLVM library" ON)
+ option(BUILD_LLVM "Build LLVM from git submodule" OFF)
+ option(STATIC_LINK_LLVM "Link against LLVM statically. This will get set to ON if you build LLVM from the submodule." OFF)
+diff --git a/Utilities/Thread.cpp b/Utilities/Thread.cpp
+index ea6a5f043..dd4c33daf 100644
+--- a/Utilities/Thread.cpp
++++ b/Utilities/Thread.cpp
+@@ -1,5 +1,15 @@
+ #include "stdafx.h"
+ #include "Emu/System.h"
++
++#include <cstdlib>
++
++// Device-lost latch (Emu/RSX/VK/vkutils/shared.cpp). Forward-declared to keep
++// Vulkan headers out of core utilities; resolved at link in this fork's
++// always-Vulkan binary. Used by the stuck-join hard-exit below.
++namespace vk
++{
++	bool is_device_lost();
++}
+ #include "Emu/Cell/SPUThread.h"
+ #include "Emu/Cell/PPUThread.h"
+ #include "Emu/Cell/PPUDisAsm.h"
+@@ -68,6 +78,10 @@ DYNAMIC_IMPORT_RENAME("Kernel32.dll", SetThreadDescriptionImport, "SetThreadDesc
+ #include <sys/syscall.h>
+ #include <sys/timerfd.h>
+ #include <unistd.h>
++// The cpu_capacity reader below uses ::open with O_* flags. Bionic pulls
++// <fcntl.h> in transitively, glibc does not -- the first Linux build of this
++// tree failed right here.
++#include <fcntl.h>
+ #endif
+ #ifdef __ANDROID__
+ // For the allocation-free breadcrumb the fault handler writes before it risks anything else, and
+@@ -4469,7 +4483,25 @@ bool thread_base::join(bool dtor) const
+ 
+ 		if (i >= 16 && !(i & (i - 1)) && timeout != atomic_wait_timeout::inf)
+ 		{
+-			sig_log.error("Thread [%s] is too sleepy. Waiting for it %.3fus already!", *m_tname.load(), (utils::get_tsc() - stamp0) / (utils::get_tsc_freq() / 1000000.));
++			const f64 waited_us = (utils::get_tsc() - stamp0) / (utils::get_tsc_freq() / 1000000.);
++			sig_log.error("Thread [%s] is too sleepy. Waiting for it %.3fus already!", *m_tname.load(), waited_us);
++
++			// Under a GPU device loss a stuck join is unwinnable in
++			// principle: a thread that emergency-exited on a DEVICE_LOST
++			// fatal dies WITHOUT unwinding, so any lock it held is orphaned
++			// (observed live 2026-07-04: PPU thread died holding the
++			// texture_cache shared_mutex; rsx::thread blocked on it forever;
++			// this join then waited on rsx doubling into the minutes). The
++			// process is stopping anyway — after 15 s, abandon the teardown
++			// outright. _Exit skips all remaining joins and destructors,
++			// which on a dead device is correct by construction (the kernel
++			// reclaims device objects and memory; persistent state was
++			// already flushed by the stop request).
++			if (waited_us > 15'000'000. && vk::is_device_lost())
++			{
++				sig_log.error("Device lost and join stuck for %.1fs: abandoning teardown, hard exit.", waited_us / 1000000.);
++				std::_Exit(0);
++			}
+ 		}
+ 	}
+ 
+diff --git a/rpcs3/Emu/CMakeLists.txt b/rpcs3/Emu/CMakeLists.txt
+index afe9cb627..c3ca292c4 100644
+--- a/rpcs3/Emu/CMakeLists.txt
++++ b/rpcs3/Emu/CMakeLists.txt
+@@ -19,6 +19,7 @@ add_library(rpcs3_emu STATIC
+     perf_monitor.cpp
+     IPC_config.cpp
+     IPC_socket.cpp
++    pitlink/pitlink.cpp
+ )
+ 
+ if(USE_LTO)
+@@ -151,10 +152,22 @@ target_sources(rpcs3_emu PRIVATE
+     Audio/AudioDumper.cpp
+     Audio/AudioBackend.cpp
+     Audio/Cubeb/CubebBackend.cpp
+-    Audio/Oboe/OboeBackend.cpp
+     Audio/Cubeb/cubeb_enumerator.cpp
+ )
+ 
++# ARMSX3: the Oboe audio backend is Android-only. Its headers come from
++# 3rdparty::oboe, which is linked only on Android (see the link block below),
++# so listing the source unconditionally breaks every non-Android build at
++# dependency scanning ('oboe/Oboe.h' file not found) -- found by the first
++# Linux build of this tree. The backend is only ever constructed from the
++# Android bridge; no code under rpcs3/ references it, so a desktop build
++# loses nothing by never parsing it.
++if(ANDROID)
++    target_sources(rpcs3_emu PRIVATE
++        Audio/Oboe/OboeBackend.cpp
++    )
++endif()
++
+ if(USE_FAUDIO)
+     find_package(SDL3)
+     if(SDL3_FOUND AND SDL3_VERSION VERSION_GREATER_EQUAL 3.2.0)
+@@ -634,6 +647,38 @@ if(NOT APPLE)
+ endif()
+ 
+ if(TARGET 3rdparty_vulkan)
++    # ETK 0.9.0.1: the FrameGen sources compile on ANDROID ONLY. (1) They do
++    # not build anywhere else: FrameGenTypes.h includes a "Config.h" that
++    # exists nowhere in this repository (the Android releases evidently build
++    # against an untracked local file). (2) Their licensing is unresolved
++    # in-tree: FrameGenTypes.h still carries "do not carry these files" into
++    # GPL-2.0-only RPCS3, while the comment kept below claims an author
++    # relicense. The desktop glue (VKFrameGen.cpp) already stubs the entire
++    # vk::frame_gen API behind #ifdef __ANDROID__, so gating the sources
++    # matches the port's own design.
++    if(ANDROID)
++        target_sources(rpcs3_emu PRIVATE
++            # Frame generation, ported from Eden (CamilleLaVey, eden PR #4263) via ARMSX2, and
++            # relicensed GPL-2.0-or-later by its author for use here. Runs the passes on OUR device
++            # in our own present path -- the earlier implementation lived behind a dlopen'd .so with
++            # its own VkDevice, which forced every frame through an AHardwareBuffer round-trip.
++            RSX/VK/FrameGen/FrameGen.cpp
++            RSX/VK/FrameGen/FrameGenPacer.cpp
++            RSX/VK/FrameGen/LosslessDll.cpp
++            RSX/VK/FrameGen/LsfgAlpha.cpp
++            RSX/VK/FrameGen/LsfgBeta.cpp
++            RSX/VK/FrameGen/LsfgChain.cpp
++            RSX/VK/FrameGen/LsfgCommon.cpp
++            RSX/VK/FrameGen/LsfgDelta.cpp
++            RSX/VK/FrameGen/LsfgGamma.cpp
++            RSX/VK/FrameGen/LsfgGenerate.cpp
++            RSX/VK/FrameGen/LsfgMipmaps.cpp
++            RSX/VK/FrameGen/LsfgShaders.cpp
++            RSX/VK/FrameGen/LsfgTranslate.cpp
++            RSX/VK/FrameGen/LsfgUtil.cpp
++            RSX/VK/FrameGen/LsfgVkCompat.cpp
++        )
++    endif()
+     target_sources(rpcs3_emu PRIVATE
+         RSX/VK/upscalers/fsr1/fsr_pass.cpp
+         RSX/VK/upscalers/sgsr/sgsr_pass.cpp
+@@ -657,25 +702,6 @@ if(TARGET 3rdparty_vulkan)
+         RSX/VK/vkutils/sampler.cpp
+         RSX/VK/vkutils/shared.cpp
+         RSX/VK/vkutils/unique_resource.cpp
+-        # Frame generation, ported from Eden (CamilleLaVey, eden PR #4263) via ARMSX2, and
+-        # relicensed GPL-2.0-or-later by its author for use here. Runs the passes on OUR device
+-        # in our own present path -- the earlier implementation lived behind a dlopen'd .so with
+-        # its own VkDevice, which forced every frame through an AHardwareBuffer round-trip.
+-        RSX/VK/FrameGen/FrameGen.cpp
+-        RSX/VK/FrameGen/FrameGenPacer.cpp
+-        RSX/VK/FrameGen/LosslessDll.cpp
+-        RSX/VK/FrameGen/LsfgAlpha.cpp
+-        RSX/VK/FrameGen/LsfgBeta.cpp
+-        RSX/VK/FrameGen/LsfgChain.cpp
+-        RSX/VK/FrameGen/LsfgCommon.cpp
+-        RSX/VK/FrameGen/LsfgDelta.cpp
+-        RSX/VK/FrameGen/LsfgGamma.cpp
+-        RSX/VK/FrameGen/LsfgGenerate.cpp
+-        RSX/VK/FrameGen/LsfgMipmaps.cpp
+-        RSX/VK/FrameGen/LsfgShaders.cpp
+-        RSX/VK/FrameGen/LsfgTranslate.cpp
+-        RSX/VK/FrameGen/LsfgUtil.cpp
+-        RSX/VK/FrameGen/LsfgVkCompat.cpp
+         RSX/VK/VKAsyncScheduler.cpp
+         RSX/VK/VKCommandStream.cpp
+         RSX/VK/VKCommonDecompiler.cpp
+diff --git a/rpcs3/Emu/Cell/Modules/cellAudio.cpp b/rpcs3/Emu/Cell/Modules/cellAudio.cpp
+index 82439027a..2f93dfcfa 100644
+--- a/rpcs3/Emu/Cell/Modules/cellAudio.cpp
++++ b/rpcs3/Emu/Cell/Modules/cellAudio.cpp
+@@ -10,9 +10,73 @@
+ #include "util/video_provider.h"
+ 
+ #include <cmath>
++#include <cstdio>
++#include <ctime>
+ 
+ LOG_CHANNEL(cellAudio);
+ 
++// =========================================================================
++// ETK GTK-Edition audio telemetry (aud1) — counters only, ZERO behavior
++// change. Backend underruns are otherwise silent zero/last-sample fill with
++// no log line at any level, so audible stutter leaves no forensic trace.
++// One raw text line is exported to /dev/shm/rpcs3_audio_stat every ~2 s for
++// the ETK ledger/HUD (atomic tmp+rename, ETK HUD law). Counters reset at
++// cellAudio thread start: a DRM-spawn title's second guest boot re-zeroes,
++// so end-of-session values describe the game proper, not the launcher.
++// =========================================================================
++struct etk_audio_stats_t
++{
++	atomic_t<u64> underrun_events{0}; // backend pulled more than the ring held (cubeb thread)
++	atomic_t<u64> underrun_bytes{0};  // total shortfall bytes (silence-filled downstream)
++	u64 skipped_periods = 0;          // cellAudio advanced past untouched buffers (game fell behind)
++	u64 silence_periods = 0;          // fully-untouched periods enqueued as silence
++	u64 dropped_blocks = 0;           // whole blocks commit_data could not fit into the ring (cellAudio thread)
++	f32 ratio_min = 1.0f;             // lowest time-stretch frequency ratio since start
++	u64 start_us = 0;                 // emu clock at reset
++};
++static etk_audio_stats_t s_etk_aud{};
++
++static void etk_audio_stats_dump(u64 timestamp_us, f32 cur_ratio, u64 enqueued_playtime_us, u32 buf_ms)
++{
++#ifdef __linux__
++	char line[256];
++	const int n = std::snprintf(line, sizeof(line),
++		"up_s=%.1f ur=%llu urb=%llu skip=%llu sil=%llu ratio=%.3f rmin=%.3f enq_ms=%.1f buf_ms=%u drop=%llu\n",
++		(timestamp_us - s_etk_aud.start_us) / 1'000'000.0,
++		static_cast<unsigned long long>(s_etk_aud.underrun_events.load()),
++		static_cast<unsigned long long>(s_etk_aud.underrun_bytes.load()),
++		static_cast<unsigned long long>(s_etk_aud.skipped_periods),
++		static_cast<unsigned long long>(s_etk_aud.silence_periods),
++		cur_ratio, s_etk_aud.ratio_min,
++		enqueued_playtime_us / 1000.0, buf_ms,
++		static_cast<unsigned long long>(s_etk_aud.dropped_blocks));
++	if (n <= 0) return;
++
++	// Snapshot: latest values, atomically swapped (ETK ledger reads this at post-mortem)
++	if (std::FILE* f = std::fopen("/dev/shm/rpcs3_audio_stat.tmp", "w"))
++	{
++		std::fwrite(line, 1, static_cast<usz>(n), f);
++		std::fclose(f);
++		std::rename("/dev/shm/rpcs3_audio_stat.tmp", "/dev/shm/rpcs3_audio_stat");
++	}
++
++	// aud2: wall-clock-stamped timeline append — one line per dump, so a mixed
++	// session (TT -> ghost -> pack race) decomposes into phases post-hoc and
++	// correlates with the MangoHud fps autolog by epoch. Truncated at counter
++	// reset (fresh per guest boot); size-capped so an hours-long session can
++	// never balloon SHM (~150 KB/h at the 2 s cadence, 2 MB cap ≈ 13 h).
++	if (std::FILE* tl = std::fopen("/dev/shm/rpcs3_audio_log", "a"))
++	{
++		std::fseek(tl, 0, SEEK_END);
++		if (std::ftell(tl) < 2 * 1024 * 1024)
++		{
++			std::fprintf(tl, "ep=%llu %s", static_cast<unsigned long long>(std::time(nullptr)), line);
++		}
++		std::fclose(tl);
++	}
++#endif
++}
++
+ extern atomic_t<recording_mode> g_recording_mode;
+ 
+ extern void lv2_sleep(u64 timeout, ppu_thread* ppu = nullptr);
+@@ -197,6 +261,12 @@ f32 audio_ringbuffer::set_frequency_ratio(f32 new_ratio)
+ {
+ 	frequency_ratio = static_cast<f32>(resampler.set_tempo(new_ratio));
+ 
++	// ETK aud1: track deepest stretch engagement (cellAudio thread only)
++	if (frequency_ratio < s_etk_aud.ratio_min)
++	{
++		s_etk_aud.ratio_min = frequency_ratio;
++	}
++
+ 	return frequency_ratio;
+ }
+ 
+@@ -211,7 +281,17 @@ u32 audio_ringbuffer::backend_write_callback(u32 size, void *buf)
+ {
+ 	if (!backend_active.observe()) backend_active = true;
+ 
+-	return static_cast<u32>(cb_ringbuf.pop(buf, size, true));
++	const u32 popped = static_cast<u32>(cb_ringbuf.pop(buf, size, true));
++
++	// ETK aud1: the shortfall below is filled with silence/last-sample by the
++	// backend with no trace — this counter is the only witness. (cubeb thread)
++	if (popped < size)
++	{
++		s_etk_aud.underrun_events++;
++		s_etk_aud.underrun_bytes += size - popped;
++	}
++
++	return popped;
+ }
+ 
+ void audio_ringbuffer::backend_state_callback(AudioStateEvent event)
+@@ -330,6 +410,10 @@ void audio_ringbuffer::commit_data(f32* buf, u32 sample_cnt)
+ 
+ 	if (cb_ringbuf.push(buf, want) != want)
+ 	{
++		// ETK aud1: m_dropped_blocks dies with the ringbuffer (update_config rebuilds it on a
++		// device change or backend retry); this one is per guest boot, like the counters above.
++		s_etk_aud.dropped_blocks++;
++
+ 		if ((m_dropped_blocks++ & 0x3f) == 0)
+ 		{
+ 			cellAudio.warning("Audio: dropped %u blocks that did not fit the ring (%.1f ms queued)",
+@@ -833,6 +917,19 @@ void cell_audio_thread::operator()()
+ 
+ 	u32 loop_count = 0;
+ 
++	// ETK aud1: fresh counters per guest boot (DRM-spawn second init re-zeroes)
++	s_etk_aud.underrun_events = 0;
++	s_etk_aud.underrun_bytes = 0;
++	s_etk_aud.skipped_periods = 0;
++	s_etk_aud.silence_periods = 0;
++	s_etk_aud.dropped_blocks = 0;
++	s_etk_aud.ratio_min = 1.0f;
++	s_etk_aud.start_us = get_system_time();
++	u64 etk_last_dump_us = 0;
++#ifdef __linux__
++	std::remove("/dev/shm/rpcs3_audio_log"); // aud2: fresh timeline per guest boot
++#endif
++
+ 	// Main cellAudio loop
+ 	while (thread_ctrl::state() != thread_state::aborting)
+ 	{
+@@ -873,6 +970,14 @@ void cell_audio_thread::operator()()
+ 
+ 		const u64 time_since_last_period = timestamp - m_last_period_end;
+ 
++		// ETK aud1: telemetry export (~2 s cadence; /dev/shm write is memory-only)
++		if (timestamp - etk_last_dump_us > 2'000'000)
++		{
++			etk_audio_stats_dump(timestamp, ringbuffer->get_frequency_ratio(),
++				ringbuffer->get_enqueued_playtime(), static_cast<u32>(cfg.raw.desired_buffer_duration));
++			etk_last_dump_us = timestamp;
++		}
++
+ 		// Handle audio restart
+ 		if (m_audio_should_restart)
+ 		{
+@@ -1089,6 +1194,7 @@ void cell_audio_thread::operator()()
+ 				{
+ 					// There's no audio in the buffers, simply advance time and hope the game recovers
+ 					cellAudio.trace("advancing time: untouched=%u/%u (expected=%u), enqueued_buffers=%llu", untouched, active_ports, untouched_expected, enqueued_buffers);
++					s_etk_aud.skipped_periods++; // ETK aud1: game fell behind an audio period
+ 					note_untouched(untouched, active_ports);
+ 					advance(timestamp);
+ 					continue;
+@@ -1104,6 +1210,7 @@ void cell_audio_thread::operator()()
+ 			{
+ 				// There's no audio in the buffers, simply advance time
+ 				cellAudio.trace("enqueuing silence: untouched=%u/%u (expected=%u), enqueued_buffers=%llu", untouched, active_ports, untouched_expected, enqueued_buffers);
++				s_etk_aud.silence_periods++; // ETK aud1: a fully-silent period shipped to the backend
+ 				ringbuffer->enqueue_silence();
+ 				note_untouched(untouched, active_ports);
+ 				advance(timestamp);
+@@ -1202,6 +1309,10 @@ void cell_audio_thread::operator()()
+ 		advance(timestamp);
+ 	}
+ 
++	// ETK aud1: final dump so post-mortem reads end-of-session values, not a ≤2s-stale line
++	etk_audio_stats_dump(get_system_time(), ringbuffer->get_frequency_ratio(),
++		ringbuffer->get_enqueued_playtime(), static_cast<u32>(cfg.raw.desired_buffer_duration));
++
+ 	// Destroy ringbuffer
+ 	ringbuffer.reset();
+ 
+diff --git a/rpcs3/Emu/Cell/Modules/cellSysutil.cpp b/rpcs3/Emu/Cell/Modules/cellSysutil.cpp
+index 884cfbaa0..d78bc1507 100644
+--- a/rpcs3/Emu/Cell/Modules/cellSysutil.cpp
++++ b/rpcs3/Emu/Cell/Modules/cellSysutil.cpp
+@@ -8,7 +8,11 @@
+ 
+ #include "Emu/Cell/lv2/sys_game.h"
+ #include "Emu/Cell/lv2/sys_process.h"
++#include "Emu/Cell/lv2/sys_mmapper.h"
++#include "Emu/Cell/lv2/sys_prx.h"
++#include "Emu/savestate_utils.hpp"
+ #include "cellSysutil.h"
++#include "sysPrxForUser.h"
+ 
+ #include "Utilities/StrUtil.h"
+ #include "Utilities/lockless.h"
+@@ -18,6 +22,118 @@
+ 
+ LOG_CHANNEL(cellSysutil);
+ 
++namespace
++{
++	struct sysutil_module
++	{
++		be_t<u32> start[2];
++		be_t<u32> stop[2];
++		be_t<u32> address;
++		be_t<u32> ref_count;
++	};
++}
++
++// ETK: the sysutil startup mapping from upstream #19467, restored without that PR's cellAudio half.
++// ARMSX3 e24761512 reverted all of #19467 for Mortal Kombat KE's WB-logo hang, whose trigger
++// (closing and reopening audio ports, with libmixer's thread running) only the cellAudio half
++// touches. This half runs once, when libsysutil starts, and reserves the 256 MB shared memory area.
++// Upstream #19482 (68a02c576), written on top of #19467, shrank the user64k reservation from 512 MB
++// to 256 MB, and this area took the freed 0x20000000 slot. Without it, every area a game reserves
++// with sys_mmapper_allocate_address lands 256 MB lower than on any earlier core, and Gran Turismo 6
++// (BCUS98296) deadlocks at boot (hunt-20261010-gt6, m02-m10).
++error_code sysutilModuleStart(ppu_thread& ppu, u32 args, vm::ptr<void> argp)
++{
++	cellSysutil.notice("module_start(args=%d, argp=*0x%x)", args, argp);
++
++	const std::unique_lock savestate_lock{ g_fxo->get<hle_locks_t>(), std::try_to_lock };
++
++	if (!savestate_lock)
++	{
++		ppu.state += cpu_flag::again;
++		return {};
++	}
++
++	const vm::ptr<sysutil_module> data = vm::cast(ppu.gpr[2]);
++
++	if (++data->ref_count != 1u)
++	{
++		return CELL_OK;
++	}
++
++	const vm::var<u32> memory_id;
++
++	// firmware still returns success if setup fails, a failed map leaves the handle around
++	if (sys_mmapper_allocate_shared_memory(ppu, SYS_MMAPPER_SYSUTIL_SHM_KEY, 0x10000, 0x200, memory_id))
++	{
++		return CELL_OK;
++	}
++
++	const vm::var<u32> area;
++
++	if (!sys_mmapper_get_shared_memory_area(ppu, 0x20full, +area))
++	{
++		sys_mmapper_search_and_map(ppu, *area, *memory_id, 0x40000, data.ptr(&sysutil_module::address));
++	}
++
++	return CELL_OK;
++}
++
++error_code sysutilModuleStop(ppu_thread& ppu)
++{
++	cellSysutil.notice("module_stop()");
++
++	const std::unique_lock savestate_lock{ g_fxo->get<hle_locks_t>(), std::try_to_lock };
++
++	if (!savestate_lock)
++	{
++		ppu.state += cpu_flag::again;
++		return {};
++	}
++
++	const vm::ptr<sysutil_module> data = vm::cast(ppu.gpr[2]);
++
++	if (--data->ref_count || !data->address)
++	{
++		return CELL_OK;
++	}
++
++	const vm::var<u32> memory_id;
++
++	if (!sys_mmapper_unmap_shared_memory(ppu, data->address, memory_id))
++	{
++		data->address = 0;
++		// another mapping can keep this busy, firmware leaves the handle around here too
++		sys_mmapper_free_shared_memory(ppu, *memory_id);
++	}
++
++	return CELL_OK;
++}
++
++bool sysutilModuleInit(lv2_prx& prx)
++{
++	if (!prx.hle_data)
++	{
++		prx.hle_data = vm::alloc(sizeof(sysutil_module), vm::main);
++
++		if (!prx.hle_data)
++		{
++			return false;
++		}
++
++		*vm::ptr<sysutil_module>{vm::cast(prx.hle_data)} = {};
++	}
++
++	const vm::ptr<sysutil_module> data = vm::cast(prx.hle_data);
++	const auto& funcs = g_fxo->get<ppu_function_manager>();
++	data->start[0] = funcs.func_addr(FIND_FUNC(sysutilModuleStart), true);
++	data->start[1] = data.addr();
++	data->stop[0] = funcs.func_addr(FIND_FUNC(sysutilModuleStop), true);
++	data->stop[1] = data.addr();
++	prx.start = vm::cast(data.ptr(&sysutil_module::start).addr());
++	prx.stop = vm::cast(data.ptr(&sysutil_module::stop).addr());
++	return true;
++}
++
+ template<>
+ void fmt_class_string<CellSysutilError>::format(std::string& out, u64 arg)
+ {
+@@ -1129,6 +1245,9 @@ extern void cellSysutil_SysCache_init();
+ 
+ DECLARE(ppu_module_manager::cellSysutil)("cellSysutil", []()
+ {
++	REG_HIDDEN_FUNC(sysutilModuleStart);
++	REG_HIDDEN_FUNC(sysutilModuleStop);
++
+ 	cellSysutil_SaveData_init(); // cellSaveData functions
+ 	cellSysutil_GameData_init(); // cellGameData, cellHddGame functions
+ 	cellSysutil_MsgDialog_init(); // cellMsgDialog functions
+diff --git a/rpcs3/Emu/Cell/Modules/sysPrxForUser.h b/rpcs3/Emu/Cell/Modules/sysPrxForUser.h
+index 5a05e2c07..93af480a0 100644
+--- a/rpcs3/Emu/Cell/Modules/sysPrxForUser.h
++++ b/rpcs3/Emu/Cell/Modules/sysPrxForUser.h
+@@ -19,6 +19,8 @@ extern spu_printf_cb_t g_spu_printf_dtcb;
+ 
+ // Functions
+ 
++error_code sys_mmapper_get_shared_memory_area(ppu_thread& ppu, u64 flags, vm::ptr<u32> address);
++
+ vm::ptr<void> _sys_memset(vm::ptr<void> dst, s32 value, u32 size);
+ 
+ struct sys_lwmutex_t;
+diff --git a/rpcs3/Emu/Cell/Modules/sys_mmapper_.cpp b/rpcs3/Emu/Cell/Modules/sys_mmapper_.cpp
+index cd093ba1c..4ffcd6ac4 100644
+--- a/rpcs3/Emu/Cell/Modules/sys_mmapper_.cpp
++++ b/rpcs3/Emu/Cell/Modules/sys_mmapper_.cpp
+@@ -1,9 +1,61 @@
+ #include "stdafx.h"
+ #include "Emu/Cell/PPUModule.h"
+ #include "Emu/Cell/lv2/sys_mmapper.h"
++#include "Emu/savestate_utils.hpp"
++#include "sysPrxForUser.h"
+ 
+ LOG_CHANNEL(sysPrxForUser);
+ 
++u32 ppu_get_exported_func_addr(u32 fnid, const std::string& module_name);
++
++namespace
++{
++	vm::gvar<u32> s_shared_memory_area;
++
++	struct shared_memory_area_lock
++	{
++		shared_mutex mutex;
++	};
++}
++
++error_code sys_mmapper_get_shared_memory_area(ppu_thread& ppu, u64 flags, vm::ptr<u32> address)
++{
++	if (const u32 entry = ppu_get_exported_func_addr(0xb5d5f64e, "sysPrxForUser"))
++	{
++		return vm::ptr<error_code(u64, vm::ptr<u32>)>{vm::cast(entry)}(ppu, flags, address);
++	}
++
++	ppu.state += cpu_flag::wait;
++
++	sysPrxForUser.notice("sys_mmapper_get_shared_memory_area(flags=0x%llx, address=*0x%x)", flags, address);
++
++	if ((flags & 0xf00) != 0x200 || ((flags & 0xff) != 0 && (flags & 0xff) != 0xf))
++	{
++		return CELL_EINVAL;
++	}
++
++	const std::unique_lock savestate_lock{ g_fxo->get<hle_locks_t>(), std::try_to_lock };
++
++	if (!savestate_lock)
++	{
++		ppu.state += cpu_flag::again;
++		return {};
++	}
++
++	std::lock_guard lock{g_fxo->get<shared_memory_area_lock>().mutex};
++
++	if (!*s_shared_memory_area)
++	{
++		if (const auto ret = sys_mmapper_allocate_address(ppu, 0x10000000, 0x20f, 0x10000000, s_shared_memory_area))
++		{
++			return ret;
++		}
++	}
++
++	*address = *s_shared_memory_area;
++	return CELL_OK;
++}
++
+ error_code sys_mmapper_allocate_memory(ppu_thread& ppu, u32 size, u64 flags, vm::ptr<u32> mem_id)
+ {
+ 	sysPrxForUser.notice("sys_mmapper_allocate_memory(size=0x%x, flags=0x%llx, mem_id=*0x%x)", size, flags, mem_id);
+@@ -41,6 +93,9 @@ error_code sys_mmapper_free_memory(ppu_thread& ppu, u32 mem_id)
+ 
+ extern void sysPrxForUser_sys_mmapper_init()
+ {
++	REG_VAR(sysPrxForUser, s_shared_memory_area).flag(MFF_HIDDEN);
++	// leave the guest import unimplemented for now, LLE sysutil waits for the missing vsh service otherwise
++
+ 	REG_FUNC(sysPrxForUser, sys_mmapper_allocate_memory);
+ 	REG_FUNC(sysPrxForUser, sys_mmapper_allocate_memory_from_container);
+ 	REG_FUNC(sysPrxForUser, sys_mmapper_map_memory);
+diff --git a/rpcs3/Emu/Cell/PPUModule.cpp b/rpcs3/Emu/Cell/PPUModule.cpp
+index 3fcc2c9aa..7f7d53791 100644
+--- a/rpcs3/Emu/Cell/PPUModule.cpp
++++ b/rpcs3/Emu/Cell/PPUModule.cpp
+@@ -20,6 +20,7 @@
+ #include "Emu/Cell/lv2/sys_process.h"
+ #include "Emu/Cell/lv2/sys_prx.h"
+ #include "Emu/Cell/lv2/sys_memory.h"
++#include "Emu/Cell/lv2/sys_mmapper.h"
+ #include "Emu/Cell/lv2/sys_overlay.h"
+ 
+ #include "Emu/Cell/Modules/StaticHLE.h"
+@@ -27,6 +28,7 @@
+ #include <map>
+ #include <span>
+ #include <set>
++#include <shared_mutex>
+ #include <algorithm>
+ #include "util/asm.hpp"
+ 
+@@ -697,7 +699,18 @@ bool ppu_form_branch_to_code(u32 entry, u32 target);
+ 
+ extern u32 ppu_get_exported_func_addr(u32 fnid, const std::string& module_name)
+ {
+-	return g_fxo->get<ppu_linkage_info>().modules[module_name].functions[fnid].export_addr;
++	auto& link = g_fxo->get<ppu_linkage_info>();
++	std::shared_lock lock(link.mutex);
++
++	const auto module = link.modules.find(module_name);
++
++	if (module == link.modules.end())
++	{
++		return 0;
++	}
++
++	const auto function = module->second.functions.find(fnid);
++	return function == module->second.functions.end() ? 0 : function->second.export_addr;
+ }
+ 
+ extern bool ppu_register_library_lock(std::string_view libname, bool lock_lib)
+@@ -2734,6 +2747,11 @@ bool ppu_load_exec(const ppu_exec_object& elf, bool virtual_load, const std::str
+ 		void init_fxo_for_exec(utils::serial* ar, bool full);
+ 		init_fxo_for_exec(ar, false);
+ 
++		if (!ar && !Emu.IsVsh())
++		{
++			init_system_shared_memory();
++		}
++
+ 		liblv2_begin = 0;
+ 		liblv2_end = 0;
+ 	}
+diff --git a/rpcs3/Emu/Cell/PPUThread.cpp b/rpcs3/Emu/Cell/PPUThread.cpp
+index 13335f626..64c8309ad 100644
+--- a/rpcs3/Emu/Cell/PPUThread.cpp
++++ b/rpcs3/Emu/Cell/PPUThread.cpp
+@@ -4302,7 +4302,7 @@ struct jit_core_allocator
+ 	// Initialize global semaphore with the max number of threads
+ 	::semaphore<0x7fff> sem{std::max<s16>(thread_count, 1)};
+ 
+-#ifdef __ANDROID__
++#if defined(__ANDROID__) || defined(ETK_CONSTRAINED_HOST)
+ 	// Held around a single module's compilation when memory is short, so that workers fall
+ 	// back to one at a time instead of all of them holding an LLVM context at once.
+ 	//
+@@ -4374,7 +4374,7 @@ struct jit_core_allocator
+ 	{
+ 		const s32 by_cores = std::min<s32>(0x7fff, utils::get_thread_count());
+ 
+-#ifdef __ANDROID__
++#if defined(__ANDROID__) || defined(ETK_CONSTRAINED_HOST)
+ 		// Bound the compile workers by RAM as well as by core count.
+ 		//
+ 		// Each LLVM PPU compile worker carries its own context, module and relocation
+@@ -5740,7 +5740,7 @@ bool ppu_initialize(const ppu_module<lv2_obj>& info, bool check_only, u64 file_s
+ 	// each additional split of JIT instance results in a downgraded version of around (100% / N-1th) - (100% / Nth) percent of instructions
+ 	// where N is the total amount of JIT instances
+ 	// Subject to change
+-#ifdef __ANDROID__
++#if defined(__ANDROID__) || defined(ETK_CONSTRAINED_HOST)
+ 	// Lowered here, because the memory this trades away is the difference between booting
+ 	// a large title and being killed partway through compiling it.
+ 	//
+@@ -6476,7 +6476,7 @@ bool ppu_initialize(const ppu_module<lv2_obj>& info, bool check_only, u64 file_s
+ 					bool compiled_this_module = false;
+ 
+ 					{
+-#ifdef __ANDROID__
++#if defined(__ANDROID__) || defined(ETK_CONSTRAINED_HOST)
+ 						// Compile alone while memory is short. Checked per module rather
+ 						// than once at startup, because that is exactly the reading that
+ 						// goes stale: workers are sized before the game has loaded.
+diff --git a/rpcs3/Emu/Cell/SPUAnalyser.h b/rpcs3/Emu/Cell/SPUAnalyser.h
+index 1598551c7..bf4effd44 100644
+--- a/rpcs3/Emu/Cell/SPUAnalyser.h
++++ b/rpcs3/Emu/Cell/SPUAnalyser.h
+@@ -1,5 +1,10 @@
+ #pragma once
+ 
++// See SPUOpcodes.h: X11's X.h leaks a CWX macro that clobbers the opcode
++// name in desktop TUs which saw X headers first. Same protection here --
++// this header spells CWX as an enum member and in the NAME table.
++#undef CWX
++
+ // SPU Instruction Type
+ struct spu_itype
+ {
+diff --git a/rpcs3/Emu/Cell/SPUCommonRecompiler.cpp b/rpcs3/Emu/Cell/SPUCommonRecompiler.cpp
+index 103070bd1..41fc05bab 100644
+--- a/rpcs3/Emu/Cell/SPUCommonRecompiler.cpp
++++ b/rpcs3/Emu/Cell/SPUCommonRecompiler.cpp
+@@ -9625,11 +9625,6 @@ spu_program spu_recompiler_base::analyse(const be_t<u32>* ls, u32 entry_point, s
+ 		{
+ 			stats.single++;
+ 
+-			if (true)
+-			{
+-				continue;
+-			}
+-
+ 			add_pattern(inst_attr::reduced_loop, loop_pc - result.entry_point, 0, std::make_shared<reduced_loop_t>(pattern));
+ 
+ 			std::string regs = "{";
+diff --git a/rpcs3/Emu/Cell/SPULLVMRecompiler.cpp b/rpcs3/Emu/Cell/SPULLVMRecompiler.cpp
+index 545cf5e3f..8f0c0c1bb 100644
+--- a/rpcs3/Emu/Cell/SPULLVMRecompiler.cpp
++++ b/rpcs3/Emu/Cell/SPULLVMRecompiler.cpp
+@@ -10214,7 +10214,7 @@ public:
+ 
+ 		const auto a = get_vr(op.ra);
+ 
+-		if (auto [ok, x, y] = match_expr(a, match<u32[4]>() + match<u32[4]>()); ok && false)
++		if (auto [ok, x, y] = match_expr(a, match<u32[4]>() + match<u32[4]>()); ok)
+ 		{
+ 			for (auto pair : std::initializer_list<std::pair<llvm_match_t<u32[4]>, llvm_match_t<u32[4]>>>{{x, y}, {y, x}})
+ 			{
+@@ -10247,7 +10247,7 @@ public:
+ 		{
+ 			for (auto pair : std::initializer_list<std::pair<llvm_match_t<u32[4]>, llvm_match_t<u32[4]>>>{{x, y}, {y, x}})
+ 			{
+-				if (auto [ok, data] = get_const_vector(pair.first.value, m_pos); ok && false)
++				if (auto [ok, data] = get_const_vector(pair.first.value, m_pos); ok)
+ 				{
+ 					// "sign extend" offset addend
+ 					const u64 addend = (data._u32[3] >= SPU_LS_SIZE) ? data._u32[3] | ~u64{SPU_LS_SIZE - 1} : data._u32[3];
+diff --git a/rpcs3/Emu/Cell/SPUOpcodes.h b/rpcs3/Emu/Cell/SPUOpcodes.h
+index 42d76792a..52b60f1a7 100644
+--- a/rpcs3/Emu/Cell/SPUOpcodes.h
++++ b/rpcs3/Emu/Cell/SPUOpcodes.h
+@@ -1,5 +1,13 @@
+ #pragma once
+ 
++// X11's X.h defines CWX (a ConfigureWindow value mask) as a bare macro, which
++// clobbers the SPU opcode name of the same spelling in any desktop TU that saw
++// X headers before this one -- the perf overlay does, via the display chain
++// under HAVE_X11, since it reads SPU state through SPUThread.h. Android never
++// meets X11, which is why this only surfaces on a Linux build. #undef of an
++// undefined macro is well-formed, so this costs nothing everywhere else.
++#undef CWX
++
+ #include "Utilities/BitField.h"
+ 
+ union spu_opcode_t
+diff --git a/rpcs3/Emu/Cell/SPUThread.cpp b/rpcs3/Emu/Cell/SPUThread.cpp
+index 559109932..27e4dae4c 100644
+--- a/rpcs3/Emu/Cell/SPUThread.cpp
++++ b/rpcs3/Emu/Cell/SPUThread.cpp
+@@ -18,6 +18,7 @@
+ #include "Emu/Cell/lv2/sys_event_flag.h"
+ #include "Emu/Cell/lv2/sys_event.h"
+ #include "Emu/Cell/lv2/sys_interrupt.h"
++#include "Emu/Cell/lv2/sys_mmapper.h"
+ 
+ #include "Emu/Cell/SPUDisAsm.h"
+ #include "Emu/Cell/SPUAnalyser.h"
+@@ -2743,6 +2744,73 @@ struct ppu_watch_putll_report
+ };
+ 
+ 
++// Whether the access-violation handler would serve a fault on this transfer instead of killing the
++// thread: every byte that is not backed lies in an area the game armed with
++// sys_mmapper_enable_page_fault_notification. The handler posts such a fault to the game's queue,
++// the game maps the page and resumes the thread, and the copy completes. This is the same lookup
++// the handler does (Utilities/Thread.cpp): the vm block's base against the notification entries,
++// with a live port and queue, from a PPU or SPU thread.
++//
++// Gran Turismo 6 (BCUS98296) demand-maps a 256 MB arena this way (0x60000000 on the usual layout).
++// Its PPU threads fault into it all through boot, and PDICellSpursKernel0 PUTs 16 KB to 0x611d0000
++// while that page is still unmapped. The unbacked guard below dropped that PUT, the data never
++// landed, and GT6 read a null pointer at 0x00979c58 three seconds later (hunt-20261010-gt6,
++// m04-m13). Such an area can only start inside 0x20000000-0xC0000000
++// (sys_mmapper_enable_page_fault_notification refuses anything else), so none of Killzone 3's bad
++// addresses (main memory, and the SPU MMIO range) can match.
++static bool spu_dma_fault_is_served(u32 eal, u32 size, bool is_get)
++{
++	const auto cpu = get_current_cpu_thread();
++
++	if (!cpu || (cpu->get_class() != thread_class::ppu && cpu->get_class() != thread_class::spu))
++	{
++		return false;
++	}
++
++	auto& pf_entries = g_fxo->get<page_fault_notification_entries>();
++
++	const auto armed = [&](u32 addr)
++	{
++		const auto area = vm::get(vm::any, addr);
++
++		if (!area)
++		{
++			return false;
++		}
++
++		reader_lock lock(pf_entries.mutex);
++
++		for (const auto& entry : pf_entries.entries)
++		{
++			if (entry.start_addr == area->addr)
++			{
++				const auto port = idm::get_unlocked<lv2_obj, lv2_event_port>(entry.port_id);
++				return port && port->queue;
++			}
++		}
++
++		return false;
++	};
++
++	// Page by page (at most five for a 16 KB transfer): a page the copy can use is fine, any other
++	// page has to be one the handler would hand to the game.
++	const auto need = is_get ? vm::page_readable : vm::page_writable;
++	const u32 last = (eal + size - 1) & -4096;
++
++	for (u32 page = eal & -4096;; page += 4096)
++	{
++		if (!vm::check_addr(page, need) && !armed(page))
++		{
++			return false;
++		}
++
++		if (page == last)
++		{
++			return true;
++		}
++	}
++}
++
+ void spu_thread::do_dma_transfer(spu_thread* _this, const spu_mfc_cmd& args, u8* ls)
+ {
+ 	// Per DMA transfer; only the destructor reads it, and only under perf_report.
+@@ -3054,9 +3122,14 @@ void spu_thread::do_dma_transfer(spu_thread* _this, const spu_mfc_cmd& args, u8*
+ 		const bool raw_spu_ls = eal >= RAW_SPU_BASE_ADDR && eal < SYS_SPU_THREAD_BASE_LOW &&
+ 			(eal - RAW_SPU_BASE_ADDR) % RAW_SPU_OFFSET + args.size - 1 < SPU_LS_SIZE;
+ 
++		// A page in a demand-mapped area is not unbacked, only not mapped YET. The copy below faults
++		// on it, the handler hands the fault to the game's page-fault thread, and the thread resumes
++		// once the page is there -- which is what the MFC does on hardware too. Declining it instead
++		// dropped Gran Turismo 6's first PUT into such a page (see spu_dma_fault_is_served).
+ 		const bool unbacked = eal >= RAW_SPU_BASE_ADDR && !raw_spu_ls
+ 			? (is_get ? src == guest : dst == guest) // the MMIO block declined to redirect it
+-			: !vm::check_addr(eal, is_get ? vm::page_readable : vm::page_writable, args.size);
++			: !vm::check_addr(eal, is_get ? vm::page_readable : vm::page_writable, args.size) &&
++				!spu_dma_fault_is_served(eal, args.size, is_get);
+ 
+ 		if (unbacked) [[unlikely]]
+ 		{
+@@ -7999,6 +8072,13 @@ extern void resume_spu_thread_group_from_waiting(spu_thread& spu, std::array<sha
+ 	}
+ }
+ 
++// ETK 0.8.3-dev (2026-08-05): clang 22.1.8 -O2 on aarch64 miscompiles this
++// function (or exploits latent UB in it); clang 19.1.7 does not. Symptom: the
++// SPURS group exit/restart context is corrupted, so pre-2008-SDK SPURS kernels
++// (GT5P Spec II BCUS98158) restart at a garbage PC and die reading a
++// shuffle-index-shaped pointer. Decoder-independent (LLVM/dynamic/static all
++// die identically); isolated by per-function optnone bisection over 8 hardware
++// boots. Remove once the root cause is fixed upstream.
+ bool spu_thread::stop_and_signal(u32 code)
+ {
+ 	auto set_status_npc = [&]()
+diff --git a/rpcs3/Emu/Cell/lv2/sys_mmapper.cpp b/rpcs3/Emu/Cell/lv2/sys_mmapper.cpp
+index 0b75dc20b..3f98607af 100644
+--- a/rpcs3/Emu/Cell/lv2/sys_mmapper.cpp
++++ b/rpcs3/Emu/Cell/lv2/sys_mmapper.cpp
+@@ -3,6 +3,7 @@
+ 
+ #include "Emu/Cell/PPUThread.h"
+ #include "Emu/Cell/lv2/sys_event.h"
++#include "Emu/savestate_utils.hpp"
+ #include "Emu/Memory/vm_var.h"
+ #include "sys_memory.h"
+ #include "sys_sync.h"
+@@ -14,6 +15,18 @@
+ 
+ LOG_CHANNEL(sys_mmapper);
+ 
++void init_system_shared_memory()
++{
++	for (u64 key : {SYS_MMAPPER_SYSUTIL_SHM_KEY, SYS_MMAPPER_MIO_SHM_KEY})
++	{
++		ensure(idm::import<lv2_obj, lv2_memory>([&]() -> shared_ptr<lv2_memory>
++		{
++			auto memory = make_shared<lv2_memory>(0x10000, 0x10000, 0x200, key, true, nullptr);
++			memory->system_handle = idm::last_id<lv2_memory>();
++			return lv2_obj::load(key, std::move(memory));
++		}));
++	}
++}
+ 
+ template <>
+ void fmt_class_string<lv2_mem_container_id>::format(std::string& out, u64 arg)
+@@ -47,23 +60,32 @@ lv2_memory::lv2_memory(utils::serial& ar)
+ 	, flags(ar)
+ 	, key(ar)
+ 	, pshared(ar)
+-	, ct(lv2_memory_container::search(ar.pop<u32>()))
+-	, shm([&](u32 addr) -> shared_ptr<std::shared_ptr<utils::shm>>
++	, ct([&](u32 id) -> lv2_memory_container*
+ 	{
+-		if (addr)
+-		{
+-			return make_single_value(ensure(vm::get(vm::any, addr)->peek(addr).second));
+-		}
+-
+-		return null_ptr;
++		return id ? ensure(lv2_memory_container::search(id)) : nullptr;
+ 	}(ar.pop<u32>()))
+-	, counter(ar.pop<u32>())
++	, system_handle(ar)
++	, shm(null_ptr)
+ {
++	const u32 addr{ar};
++	counter = ar.pop<u32>();
++	external_refs = ar.pop<u32>();
++
++	if (addr)
++	{
++		shm = make_single_value(ensure(vm::get(vm::any, addr)->peek(addr).second));
++	}
++	else if (ar.pop<bool>())
++	{
++		auto data = std::make_shared<utils::shm>(size, 1);
++		ar(std::span<u8>(ensure(data->map_self()), size));
++		shm = make_single_value(std::move(data));
++	}
+ }
+ 
+ CellError lv2_memory::on_id_create()
+ {
+-	if (!exists && !ct->take(size))
++	if (!exists && !external_refs && ct && !ct->take(size))
+ 	{
+ 		sys_mmapper.error("lv2_memory::on_id_create(): Cannot allocate 0x%x bytes (0x%x available)", size, ct->size - ct->used);
+ 		return CELL_ENOMEM;
+@@ -73,9 +95,35 @@ CellError lv2_memory::on_id_create()
+ 	return {};
+ }
+ 
++CellError lv2_memory::on_id_create(u64 requested_size, u32 requested_align, const shared_ptr<lv2_memory>& created)
++{
++	if (this != created.get() && (size != requested_size || align != requested_align))
++	{
++		return CELL_EPERM;
++	}
++
++	if (exists > (system_handle ? 1u : 0u))
++	{
++		return CELL_EEXIST;
++	}
++
++	return on_id_create();
++}
++
+ std::function<void(void*)> lv2_memory::load(utils::serial& ar)
+ {
+ 	auto mem = make_shared<lv2_memory>(stx::exact_t<utils::serial&>(ar));
++
++	if (mem->system_handle)
++	{
++		g_fxo->need<ipc_manager<lv2_memory, u64>>();
++
++		if (auto existing = g_fxo->get<ipc_manager<lv2_memory, u64>>().get(mem->key))
++		{
++			mem = std::move(existing);
++		}
++	}
++
+ 	mem->exists++; // Disable on_id_create()
+ 	auto func = load_func(mem, +mem->pshared);
+ 	mem->exists--;
+@@ -83,12 +131,48 @@ std::function<void(void*)> lv2_memory::load(utils::serial& ar)
+ }
+ 
+ void lv2_memory::save(utils::serial& ar)
++{
++	save_data(ar);
++}
++
++void lv2_memory::save_data(utils::serial& ar)
+ {
+ 	USING_SERIALIZATION_VERSION(lv2_memory);
+ 
+-	ar(size, align, flags, key, pshared, ct->id);
+-	ar(counter ? vm::get_shm_addr(*shm.load()) : 0);
+-	ar(counter);
++	ar(size, align, flags, key, pshared, ct ? static_cast<u32>(ct->id) : 0, system_handle);
++	const auto data = shm.load();
++	const u32 addr = data ? vm::get_shm_addr(*data) : 0;
++	ar(addr);
++	ar(counter, external_refs);
++
++	if (!addr)
++	{
++		ar(static_cast<bool>(data));
++
++		if (data)
++		{
++			ar(std::span<u8>(ensure((*data)->map_self()), size));
++		}
++	}
++}
++
++void lv2_memory::release_memory()
++{
++	// the caller holds the id manager lock
++	if (exists || external_refs)
++	{
++		return;
++	}
++
++	if (pshared)
++	{
++		g_fxo->get<ipc_manager<lv2_memory, u64>>().remove(key);
++	}
++
++	if (ct)
++	{
++		ct->free(size);
++	}
+ }
+ 
+ page_fault_notification_entries::page_fault_notification_entries(utils::serial& ar)
+@@ -105,27 +189,20 @@ template <bool exclusive = false>
+ error_code create_lv2_shm(bool pshared, u64 ipc_key, u64 size, u32 align, u64 flags, lv2_memory_container* ct)
+ {
+ 	const u32 _pshared = pshared ? SYS_SYNC_PROCESS_SHARED : SYS_SYNC_NOT_PROCESS_SHARED;
++	const s32 create_mode = exclusive || (flags & 0xc000) == 0xc000 ? SYS_SYNC_NEWLY_CREATED
++		: (flags & 0x8000) ? SYS_SYNC_NOT_CARE : SYS_SYNC_NOT_CREATE;
+ 
+ 	if (!pshared)
+ 	{
+ 		ipc_key = 0;
+ 	}
+ 
+-	if (auto error = lv2_obj::create<lv2_memory>(_pshared, ipc_key, exclusive ? SYS_SYNC_NEWLY_CREATED : SYS_SYNC_NOT_CARE, [&]()
+-	{
+-		return make_shared<lv2_memory>(
+-			static_cast<u32>(size),
+-			align,
+-			flags,
+-			ipc_key,
+-			pshared,
+-			ct);
+-	}, false))
++	shared_ptr<lv2_memory> created;
++	return lv2_obj::create<lv2_memory>(_pshared, ipc_key, create_mode, [&]()
+ 	{
+-		return error;
+-	}
+-
+-	return CELL_OK;
++		created = make_shared<lv2_memory>(static_cast<u32>(size), align, flags, ipc_key, pshared, ct);
++		return created;
++	}, false, size, align, created);
+ }
+ 
+ error_code sys_mmapper_allocate_address(ppu_thread& ppu, u64 size, u64 flags, u64 alignment, vm::ptr<u32> alloc_addr)
+@@ -190,6 +267,14 @@ error_code sys_mmapper_allocate_fixed_address(ppu_thread& ppu)
+ 
+ error_code sys_mmapper_allocate_shared_memory(ppu_thread& ppu, u64 ipc_key, u64 size, u64 flags, vm::ptr<u32> mem_id)
+ {
++	const std::unique_lock savestate_lock{ g_fxo->get<hle_locks_t>(), std::try_to_lock };
++
++	if (!savestate_lock)
++	{
++		ppu.state += cpu_flag::again;
++		return {};
++	}
++
+ 	ppu.state += cpu_flag::wait;
+ 
+ 	// trace, not warning: this fires thousands of times per session in a streaming game,
+@@ -244,6 +329,14 @@ error_code sys_mmapper_allocate_shared_memory(ppu_thread& ppu, u64 ipc_key, u64
+ 
+ error_code sys_mmapper_allocate_shared_memory_from_container(ppu_thread& ppu, u64 ipc_key, u64 size, u32 cid, u64 flags, vm::ptr<u32> mem_id)
+ {
++	const std::unique_lock savestate_lock{ g_fxo->get<hle_locks_t>(), std::try_to_lock };
++
++	if (!savestate_lock)
++	{
++		ppu.state += cpu_flag::again;
++		return {};
++	}
++
+ 	ppu.state += cpu_flag::wait;
+ 
+ 	sys_mmapper.warning("sys_mmapper_allocate_shared_memory_from_container(ipc_key=0x%x, size=0x%x, cid=0x%x, flags=0x%x, mem_id=*0x%x)", ipc_key, size, cid, flags, mem_id);
+@@ -281,6 +374,11 @@ error_code sys_mmapper_allocate_shared_memory_from_container(ppu_thread& ppu, u6
+ 	}
+ 	}
+ 
++	if (flags & 0xc000)
++	{
++		return CELL_EINVAL;
++	}
++
+ 	const auto ct = idm::get_unlocked<lv2_memory_container>(cid);
+ 
+ 	if (!ct)
+@@ -288,7 +386,7 @@ error_code sys_mmapper_allocate_shared_memory_from_container(ppu_thread& ppu, u6
+ 		return CELL_ESRCH;
+ 	}
+ 
+-	if (auto error = create_lv2_shm(ipc_key != SYS_MMAPPER_NO_SHM_KEY, ipc_key, size, flags & SYS_MEMORY_PAGE_SIZE_64K ? 0x10000 : 0x100000, flags, ct.get()))
++	if (auto error = create_lv2_shm<true>(ipc_key != SYS_MMAPPER_NO_SHM_KEY, ipc_key, size, flags & SYS_MEMORY_PAGE_SIZE_64K ? 0x10000 : 0x100000, flags, ct.get()))
+ 	{
+ 		return error;
+ 	}
+@@ -300,6 +398,14 @@ error_code sys_mmapper_allocate_shared_memory_from_container(ppu_thread& ppu, u6
+ 
+ error_code sys_mmapper_allocate_shared_memory_ext(ppu_thread& ppu, u64 ipc_key, u64 size, u32 flags, vm::ptr<mmapper_unk_entry_struct0> entries, s32 entry_count, vm::ptr<u32> mem_id)
+ {
++	const std::unique_lock savestate_lock{ g_fxo->get<hle_locks_t>(), std::try_to_lock };
++
++	if (!savestate_lock)
++	{
++		ppu.state += cpu_flag::again;
++		return {};
++	}
++
+ 	ppu.state += cpu_flag::wait;
+ 
+ 	sys_mmapper.todo("sys_mmapper_allocate_shared_memory_ext(ipc_key=0x%x, size=0x%x, flags=0x%x, entries=*0x%x, entry_count=0x%x, mem_id=*0x%x)", ipc_key, size, flags, entries, entry_count, mem_id);
+@@ -399,6 +505,14 @@ error_code sys_mmapper_allocate_shared_memory_ext(ppu_thread& ppu, u64 ipc_key,
+ 
+ error_code sys_mmapper_allocate_shared_memory_from_container_ext(ppu_thread& ppu, u64 ipc_key, u64 size, u64 flags, u32 cid, vm::ptr<mmapper_unk_entry_struct0> entries, s32 entry_count, vm::ptr<u32> mem_id)
+ {
++	const std::unique_lock savestate_lock{ g_fxo->get<hle_locks_t>(), std::try_to_lock };
++
++	if (!savestate_lock)
++	{
++		ppu.state += cpu_flag::again;
++		return {};
++	}
++
+ 	ppu.state += cpu_flag::wait;
+ 
+ 	sys_mmapper.todo("sys_mmapper_allocate_shared_memory_from_container_ext(ipc_key=0x%x, size=0x%x, flags=0x%x, cid=0x%x, entries=*0x%x, entry_count=0x%x, mem_id=*0x%x)", ipc_key, size, flags, cid, entries,
+@@ -584,19 +698,19 @@ error_code sys_mmapper_free_shared_memory(ppu_thread& ppu, u32 mem_id)
+ 	// Conditionally remove memory ID
+ 	const auto mem = idm::withdraw<lv2_obj, lv2_memory>(mem_id, [&](lv2_memory& mem) -> CellError
+ 	{
+-		if (mem.counter)
++		if (mem_id == mem.system_handle)
+ 		{
+-			return CELL_EBUSY;
++			return CELL_ESRCH;
+ 		}
+ 
+-		lv2_obj::on_id_destroy(mem, mem.key, +mem.pshared);
+-
+-		if (!mem.exists)
++		if (mem.counter)
+ 		{
+-			// Return "physical memory" to the memory container
+-			mem.ct->free(mem.size);
++			return CELL_EBUSY;
+ 		}
+ 
++		lv2_obj::on_id_destroy(mem, mem.key, false);
++		mem.release_memory();
++
+ 		return {};
+ 	});
+ 
+@@ -631,6 +745,11 @@ error_code sys_mmapper_map_shared_memory(ppu_thread& ppu, u32 addr, u32 mem_id,
+ 
+ 	const auto mem = idm::get<lv2_obj, lv2_memory>(mem_id, [&](lv2_memory& mem) -> CellError
+ 	{
++		if (mem_id == mem.system_handle)
++		{
++			return CELL_ESRCH;
++		}
++
+ 		const u32 page_alignment = area->flags & SYS_MEMORY_PAGE_SIZE_64K ? 0x10000 : 0x100000;
+ 
+ 		if (mem.align < page_alignment)
+@@ -706,6 +825,11 @@ error_code sys_mmapper_search_and_map(ppu_thread& ppu, u32 start_addr, u32 mem_i
+ 
+ 	const auto mem = idm::get<lv2_obj, lv2_memory>(mem_id, [&](lv2_memory& mem) -> CellError
+ 	{
++		if (mem_id == mem.system_handle)
++		{
++			return CELL_ESRCH;
++		}
++
+ 		const u32 page_alignment = area->flags & SYS_MEMORY_PAGE_SIZE_64K ? 0x10000 : 0x100000;
+ 
+ 		if (mem.align < page_alignment)
+@@ -790,7 +914,7 @@ error_code sys_mmapper_unmap_shared_memory(ppu_thread& ppu, u32 addr, vm::ptr<u3
+ 
+ 	const auto mem = idm::select<lv2_obj, lv2_memory>([&](u32 id, lv2_memory& mem) -> u32
+ 	{
+-		if (auto shm0 = mem.shm.load(); shm0 && shm0->get() == shm.second.get())
++		if (auto shm0 = mem.shm.load(); id != mem.system_handle && shm0 && shm0->get() == shm.second.get())
+ 		{
+ 			return id;
+ 		}
+diff --git a/rpcs3/Emu/Cell/lv2/sys_mmapper.h b/rpcs3/Emu/Cell/lv2/sys_mmapper.h
+index aec727840..b5d784164 100644
+--- a/rpcs3/Emu/Cell/lv2/sys_mmapper.h
++++ b/rpcs3/Emu/Cell/lv2/sys_mmapper.h
+@@ -25,22 +25,30 @@ struct lv2_memory : lv2_obj
+ 	const u64 flags;
+ 	const u64 key; // IPC key
+ 	const bool pshared; // Process shared flag
+-	lv2_memory_container* const ct; // Associated memory container
++	lv2_memory_container* const ct; // null for system memory
++	u32 system_handle = 0; // stands in for the vsh handle
+ 	atomic_ptr<std::shared_ptr<utils::shm>> shm;
+ 
+ 	atomic_t<u32> counter{0};
++	// the game can drop its handle while audio still needs the buffer
++	atomic_t<u32> external_refs{0};
+ 
+ 	lv2_memory(u32 size, u32 align, u64 flags, u64 key, bool pshared, lv2_memory_container* ct);
+ 
+ 	lv2_memory(utils::serial& ar);
+ 	static std::function<void(void*)> load(utils::serial& ar);
+ 	void save(utils::serial& ar);
++	void save_data(utils::serial& ar);
++	void release_memory();
+ 
+ 	CellError on_id_create();
++	CellError on_id_create(u64 requested_size, u32 requested_align, const shared_ptr<lv2_memory>& created);
+ };
+ 
+ enum : u64
+ {
++	SYS_MMAPPER_SYSUTIL_SHM_KEY = 0x8006010000000010ULL,
++	SYS_MMAPPER_MIO_SHM_KEY = 0x80004d494f323211ULL,
+ 	SYS_MEMORY_PAGE_FAULT_EVENT_KEY	       = 0xfffe000000000000ULL,
+ };
+ 
+@@ -99,6 +107,7 @@ struct mmapper_unk_entry_struct0
+ // Aux
+ class ppu_thread;
+ 
++void init_system_shared_memory();
+ error_code mmapper_thread_recover_page_fault(cpu_thread* cpu);
+ 
+ // SysCalls
+diff --git a/rpcs3/Emu/Cell/lv2/sys_process.cpp b/rpcs3/Emu/Cell/lv2/sys_process.cpp
+index a9bb216e8..614b1f3fe 100644
+--- a/rpcs3/Emu/Cell/lv2/sys_process.cpp
++++ b/rpcs3/Emu/Cell/lv2/sys_process.cpp
+@@ -80,7 +80,20 @@ s32 sys_process_getppid()
+ template <typename T, typename Get>
+ u32 idm_get_count()
+ {
+-	return idm::select<T, Get>([&](u32, Get&) {});
++	u32 count = 0;
++	idm::select<T, Get>([&](u32 id, Get& obj)
++	{
++		if constexpr (std::is_same_v<Get, lv2_memory>)
++		{
++			if (id == obj.system_handle)
++			{
++				return;
++			}
++		}
++
++		count++;
++	});
++	return count;
+ }
+ 
+ error_code sys_process_get_number_of_object(u32 object, vm::ptr<u32> nump)
+@@ -123,8 +136,16 @@ error_code sys_process_get_number_of_object(u32 object, vm::ptr<u32> nump)
+ template <typename T, typename Get>
+ void idm_get_set(std::set<u32>& out)
+ {
+-	idm::select<T, Get>([&](u32 id, Get&)
++	idm::select<T, Get>([&](u32 id, Get& obj)
+ 	{
++		if constexpr (std::is_same_v<Get, lv2_memory>)
++		{
++			if (id == obj.system_handle)
++			{
++				return;
++			}
++		}
++
+ 		out.emplace(id);
+ 	});
+ }
+diff --git a/rpcs3/Emu/Cell/lv2/sys_prx.cpp b/rpcs3/Emu/Cell/lv2/sys_prx.cpp
+index d12c11d31..8e1bf0c69 100644
+--- a/rpcs3/Emu/Cell/lv2/sys_prx.cpp
++++ b/rpcs3/Emu/Cell/lv2/sys_prx.cpp
+@@ -180,6 +180,7 @@ bool ppu_register_library_lock(std::string_view libname, bool lock_lib);
+ 
+ extern error_code sysmoduleModuleStart(ppu_thread& ppu, u32 args, vm::ptr<void> argp);
+ extern error_code sysmoduleModuleStop(ppu_thread& ppu);
++extern bool sysutilModuleInit(lv2_prx& prx);
+ 
+ static error_code prx_load_module(const std::string& vpath, u64 flags, vm::ptr<sys_prx_load_module_option_t> /*pOpt*/, fs::file src = {}, s64 file_offset = 0)
+ {
+@@ -232,7 +233,7 @@ static error_code prx_load_module(const std::string& vpath, u64 flags, vm::ptr<s
+ 		ignore = g_prx_list.count(vpath0) && ::at32(g_prx_list, vpath0);
+ 	}
+ 
+-	auto hle_load = [&]()
++	auto hle_load = [&]() -> error_code
+ 	{
+ 		const auto prx = idm::make_ptr<lv2_obj, lv2_prx>();
+ 
+@@ -241,6 +242,14 @@ static error_code prx_load_module(const std::string& vpath, u64 flags, vm::ptr<s
+ 			prx->start = vm::cast(g_fxo->get<ppu_function_manager>().func_addr(FIND_FUNC(sysmoduleModuleStart)));
+ 			prx->stop = vm::cast(g_fxo->get<ppu_function_manager>().func_addr(FIND_FUNC(sysmoduleModuleStop)));
+ 		}
++		else if (name == "libsysutil.sprx")
++		{
++			if (!sysutilModuleInit(*prx))
++			{
++				ensure((idm::remove<lv2_obj, lv2_prx>(idm::last_id<lv2_prx>())));
++				return CELL_ENOMEM;
++			}
++		}
+ 
+ 		prx->name = std::move(name);
+ 		prx->path = std::move(path);
+@@ -322,6 +331,7 @@ std::function<void(void*)> lv2_prx::load(utils::serial& ar)
+ 	const std::string path = vfs::get(ar.pop<std::string>());
+ 	const s64 offset{ar};
+ 	const u32 state{ar};
++	const u32 hle_data{ar};
+ 
+ 	usz seg_count = 0;
+ 	ar.deserialize_vle<9>(seg_count);
+@@ -332,7 +342,14 @@ std::function<void(void*)> lv2_prx::load(utils::serial& ar)
+ 	{
+ 		prx = make_shared<lv2_prx>();
+ 		prx->path = path;
++		prx->hle_data = hle_data;
+ 		prx->name = path.substr(path.find_last_of(fs::delim) + 1);
++
++		if (!seg_count && prx->name == "libsysutil.sprx")
++		{
++			ensure(prx->hle_data);
++			ensure(sysutilModuleInit(*prx));
++		}
+ 	};
+ 
+ 	if (seg_count)
+@@ -392,7 +409,7 @@ void lv2_prx::save(utils::serial& ar)
+ 
+ 	const std::string vpath = vfs::retrieve(path);
+ 
+-	ar(vpath, offset, state);
++	ar(vpath, offset, state, hle_data);
+ 
+ 	// Save segments count
+ 	ar.serialize_vle(segs.size());
+@@ -765,6 +782,11 @@ error_code _sys_prx_unload_module(ppu_thread& ppu, u32 id, u64 flags, vm::ptr<sy
+ 
+ 	prx->mutex.lock_unlock();
+ 
++	if (prx->hle_data)
++	{
++		ensure(vm::dealloc(std::exchange(prx->hle_data, 0), vm::main));
++	}
++
+ 	ppu_unload_prx(*prx);
+ 
+ 	ppu_finalize(*prx);
+diff --git a/rpcs3/Emu/Cell/lv2/sys_prx.h b/rpcs3/Emu/Cell/lv2/sys_prx.h
+index a78542dcb..57d98dc2e 100644
+--- a/rpcs3/Emu/Cell/lv2/sys_prx.h
++++ b/rpcs3/Emu/Cell/lv2/sys_prx.h
+@@ -190,6 +190,7 @@ struct lv2_prx final : ppu_module<lv2_obj>
+ 
+ 	atomic_t<u32> state = PRX_STATE_INITIALIZED;
+ 	shared_mutex mutex;
++	u32 hle_data = 0;
+ 
+ 	std::unordered_map<u32, u32> specials;
+ 
+diff --git a/rpcs3/Emu/Cell/lv2/sys_sync.h b/rpcs3/Emu/Cell/lv2/sys_sync.h
+index 6d55f4b1f..f152260fc 100644
+--- a/rpcs3/Emu/Cell/lv2/sys_sync.h
++++ b/rpcs3/Emu/Cell/lv2/sys_sync.h
+@@ -308,8 +308,8 @@ public:
+ 		return (attr.pshared == SYS_SYNC_PROCESS_SHARED ? +attr.ipc_key : 0);
+ 	}
+ 
+-	template <typename T, typename F>
+-	static error_code create(u32 pshared, u64 ipc_key, s32 flags, F&& make, bool key_not_zero = true)
++	template <typename T, typename F, typename... Args>
++	static error_code create(u32 pshared, u64 ipc_key, s32 flags, F&& make, bool key_not_zero = true, Args&&... args)
+ 	{
+ 		switch (pshared)
+ 		{
+@@ -340,8 +340,7 @@ public:
+ 		default: return CELL_EINVAL;
+ 		}
+ 
+-		// EAGAIN for IDM IDs shortage
+-		CellError error = CELL_EAGAIN;
++		CellError error{};
+ 
+ 		if (!idm::import<lv2_obj, T>([&]() -> shared_ptr<T>
+ 		{
+@@ -349,7 +348,7 @@ public:
+ 
+ 			auto finalize_construct = [&]() -> shared_ptr<T>
+ 			{
+-				if ((error = result->on_id_create()))
++				if ((error = result->on_id_create(std::forward<Args>(args)...)))
+ 				{
+ 					result.reset();
+ 				}
+@@ -382,6 +381,11 @@ public:
+ 			bool added = false;
+ 			std::tie(added, result) = ipc_container.add(ipc_key, finalize_construct, flags != SYS_SYNC_NEWLY_CREATED);
+ 
++			if (error)
++			{
++				return {};
++			}
++
+ 			if (!added)
+ 			{
+ 				if (flags == SYS_SYNC_NEWLY_CREATED)
+@@ -401,7 +405,7 @@ public:
+ 			return result;
+ 		}))
+ 		{
+-			return error;
++			return error ? error : CELL_EAGAIN;
+ 		}
+ 
+ 		return CELL_OK;
+diff --git a/rpcs3/Emu/Io/PadHandler.cpp b/rpcs3/Emu/Io/PadHandler.cpp
+index 6d3c0e376..d834ad998 100644
+--- a/rpcs3/Emu/Io/PadHandler.cpp
++++ b/rpcs3/Emu/Io/PadHandler.cpp
+@@ -444,11 +444,23 @@ void PadHandlerBase::TranslateButtonPress(const std::shared_ptr<PadDevice>& devi
+ 
+ 	if (get_is_left_trigger(device, keyCode))
+ 	{
++		// Top-end range calibration: a trigger that physically saturates below
++		// trigger_max can never report a full pull. When 'Left Trigger Max' is
++		// set (0 = uncalibrated), rescale so the calibrated ceiling maps to
++		// full deflection. Applied before the threshold compare.
++		if (const u32 cal_max = device->config->ltriggermax; cal_max > 0 && cal_max < trigger_max)
++		{
++			val = static_cast<u16>(std::min<u32>(trigger_max, static_cast<u32>(val) * trigger_max / cal_max));
++		}
+ 		pressed = val > (ignore_trigger_threshold ? 0 : device->config->ltriggerthreshold);
+ 		val = pressed ? NormalizeTriggerInput(val, device->config->ltriggerthreshold) : 0;
+ 	}
+ 	else if (get_is_right_trigger(device, keyCode))
+ 	{
++		if (const u32 cal_max = device->config->rtriggermax; cal_max > 0 && cal_max < trigger_max)
++		{
++			val = static_cast<u16>(std::min<u32>(trigger_max, static_cast<u32>(val) * trigger_max / cal_max));
++		}
+ 		pressed = val > (ignore_trigger_threshold ? 0 : device->config->rtriggerthreshold);
+ 		val = pressed ? NormalizeTriggerInput(val, device->config->rtriggerthreshold) : 0;
+ 	}
+diff --git a/rpcs3/Emu/Io/pad_config.h b/rpcs3/Emu/Io/pad_config.h
+index 86779c085..d7f7f5d6f 100644
+--- a/rpcs3/Emu/Io/pad_config.h
++++ b/rpcs3/Emu/Io/pad_config.h
+@@ -126,6 +126,11 @@ struct cfg_pad final : cfg::node
+ 	cfg::uint<0, 1000000> rstick_anti_deadzone{ this, "Right Stick Anti-Deadzone", 0 };
+ 	cfg::uint<0, 1000000> ltriggerthreshold{ this, "Left Trigger Threshold", 0 };
+ 	cfg::uint<0, 1000000> rtriggerthreshold{ this, "Right Trigger Threshold", 0 };
++	// Top-end range calibration: raw axis value (handler units) treated as a
++	// full pull. 0 = uncalibrated (stock behavior). For triggers that
++	// physically saturate below the handler's full range.
++	cfg::uint<0, 1000000> ltriggermax{ this, "Left Trigger Max", 0 };
++	cfg::uint<0, 1000000> rtriggermax{ this, "Right Trigger Max", 0 };
+ 	cfg::uint<0, 1000000> lpadsquircling{ this, "Left Pad Squircling Factor", 4000 };
+ 	cfg::uint<0, 1000000> rpadsquircling{ this, "Right Pad Squircling Factor", 4000 };
+ 
+diff --git a/rpcs3/Emu/Memory/vm.cpp b/rpcs3/Emu/Memory/vm.cpp
+index 052512895..763816ec6 100644
+--- a/rpcs3/Emu/Memory/vm.cpp
++++ b/rpcs3/Emu/Memory/vm.cpp
+@@ -1423,6 +1423,8 @@ namespace vm
+ 
+ 		if (m_id.exchange(0))
+ 		{
++			std::unordered_map<const utils::shm*, s64> mapping_refs;
++
+ 			// Deallocate all memory
+ 			for (auto it = m_map.begin(), end = m_map.end(); it != end;)
+ 			{
+@@ -1436,7 +1438,40 @@ namespace vm
+ 				{
+ 					if (it->second.second.use_count() != 1)
+ 					{
+-						fmt::throw_exception("External memory usage at block 0x%x (addr=0x%x, size=0x%x)", this->addr, it->first, size);
++						if (mapping_refs.empty())
++						{
++							const auto count_refs = [&mapping_refs](const auto& map)
++							{
++								for (const auto& entry : map)
++								{
++									if (entry.second.second)
++									{
++										mapping_refs[entry.second.second.get()]++;
++									}
++								}
++							};
++
++							// count this block separately, vm::unmap removes it from g_locations before calling us
++							count_refs(m_map);
++
++							for (const auto& block : g_locations)
++							{
++								if (block && block.get() != this)
++								{
++									count_refs((block->m.*block_map)());
++								}
++							}
++						}
++
++						if (it->second.second.use_count() != mapping_refs.at(it->second.second.get()))
++						{
++							fmt::throw_exception("External memory usage at block 0x%x (addr=0x%x, size=0x%x)", this->addr, it->first, size);
++						}
++					}
++
++					if (!mapping_refs.empty())
++					{
++						mapping_refs.at(it->second.second.get())--;
+ 					}
+ 
+ 					it->second.second.reset();
+@@ -2405,29 +2440,10 @@ namespace vm
+ 
+ 		std::map<utils::shm*, usz> shared_map;
+ 
+-#ifndef _MSC_VER
+-		shared.erase(std::unique(shared.begin(), shared.end(), [](auto& a, auto& b) { return a.first == b.first; }), shared.end());
+-#else
+-		// Workaround for bugged std::unique
+-		for (auto it = shared.begin(); it != shared.end();)
+-		{
+-			if (shared_map.count(it->first))
+-			{
+-				it = shared.erase(it);
+-				continue;
+-			}
+-
+-			shared_map.emplace(it->first, 0);
+-			it++;
+-		}
+-
+-		shared_map.clear();
+-#endif
+-
+-		for (auto& p : shared)
++		std::erase_if(shared, [&](const auto& memory)
+ 		{
+-			shared_map.emplace(p.first, &p - shared.data());
+-		}
++			return !shared_map.emplace(memory.first, shared_map.size()).second;
++		});
+ 
+ 		// TODO: proper serialization of std::map
+ 		ar(static_cast<usz>(shared_map.size()));
+diff --git a/rpcs3/Emu/RSX/NV47/HW/nv406e.cpp b/rpcs3/Emu/RSX/NV47/HW/nv406e.cpp
+index 8f4807321..5cdf0a319 100644
+--- a/rpcs3/Emu/RSX/NV47/HW/nv406e.cpp
++++ b/rpcs3/Emu/RSX/NV47/HW/nv406e.cpp
+@@ -4,15 +4,43 @@
+ 
+ #include "Emu/RSX/RSXThread.h"
+ #include "Emu/RSX/rsx_profiler.h"
++#include "Utilities/Thread.h"
+ #include "util/sysinfo.hpp"
++#include "util/bless.hpp"
+ 
+ #include <chrono>
++#include <cstdlib>
+ #include <thread>
+ 
+ #include "context_accessors.define.h"
+ 
+ namespace rsx
+ {
++	namespace etk
++	{
++		// ETK KERS stage 1 — SEMA PARK counters (semapark-v1, 2026-07-12).
++		// Cumulative; the perfstat emitter (overlay_perf_metrics.cpp) extern-
++		// declares these and appends per-interval deltas to the SHM line —
++		// same cross-TU linkage idiom as vk::is_device_lost. Plain atomics:
++		// never a reason to fail, never on the R3 path.
++		//
++		// Leapfrog adaptation (0003-etk-identity): the park survives as the
++		// escalation tier of THIS base's own tiered wait. The base already
++		// bounds the hot spin (500-lap spin budget, then a WFE event-stream
++		// tick or a timed 100 us sleep per lap) — but WFE idles the core
++		// without RELEASING it, and on an oversubscribed rig (6 SPU threads
++		// + PPU + RSX on 8 cores) a real kernel sleep gives the core away.
++		// With GTK_SEMA_PARK enabled (default), a post-budget lap takes the
++		// timed futex park; GTK_SEMA_PARK=0 restores the base's stock paced
++		// wait bit-for-bit. Counter meanings are unchanged from v1/v2, so
++		// the ledger reading carries over exactly (pk=0 = kill-switch
++		// active, sw collapsing toward pk = the wait is parking).
++		atomic_t<u64> g_sema_acquires{0};   // acquire calls that had to wait
++		atomic_t<u64> g_sema_wakes{0};      // wait-loop iterations
++		atomic_t<u64> g_sema_parks{0};      // timed futex parks taken (non-flip)
++		atomic_t<u64> g_sema_parks_flip{0}; // timed futex parks taken on the FLIP semaphore (v2)
++	}
++
+ 	namespace nv406e
+ 	{
+ 		// Address of a semaphore an acquire has given up on, and how many acquires have done so.
+@@ -23,6 +51,84 @@ namespace rsx
+ 		static atomic_t<u32> g_stuck_sema_addr{0};
+ 		static atomic_t<u32> g_stuck_sema_count{0};
+ 
++		// ETK KERS stage 1 — SEMA PARK (semapark-v1 2026-07-12, v2 2026-07-13;
++		// design: dossiers/KersConcept_20260712.md §3-K1).
++		//
++		// Original evidence (SM8250 pack racing): this wait loop was the single
++		// hottest symbol in the process — 10.7-11.8% of ALL cycles across three
++		// 30 s perf samples (NPEA00502, 2026-07-12) — because the armed-WFE wait
++		// wakes on every neighboring GCM label invalidation (labels are 16 bytes
++		// apart: FOUR share each monitored 64 B line). v1 parked non-flip waits
++		// on a timed futex; v2 extended the park to the FLIP semaphore after the
++		// v1 counters proved the flip wait was the actual core-cooker (one
++		// interval: sw=5,554,102 with pk=0 — a 13-16M laps/s monitor-clear hot
++		// spin — while the one eligible non-flip wait parked at 89% efficiency).
++		//
++		// Leapfrog adaptation: this base's rewritten loop already has a tiered
++		// escalation (500-lap spin budget, then a bare-WFE event-stream tick or
++		// a 100 us scheduler sleep per lap), which kills the invalidation-storm
++		// hot spin on its own. The park plugs into that SAME tier as the
++		// deeper-sleep option: a timed futex park frees the core for the SPU
++		// threads instead of idling it in WFE. Releases are plain vm::write
++		// with no futex notify, so the park is timeout-bounded by construction;
++		// the full loop preamble (stop/tdr/service checks and
++		// on_semaphore_acquire_wait) re-runs after every park.
++		//
++		// Default ON (house law: new-build features ship on, kill-switch for
++		// A/B): GTK_SEMA_PARK=0 disables, restoring this base's stock paced
++		// wait. GTK_SEMA_PARK_FLIP=0 restores the v1 flip exclusion. Park
++		// periods: GTK_SEMA_PARK_US (default 200), GTK_SEMA_PARK_FLIP_US
++		// (default 100 — <=0.6% of a 16.7 ms frame in added flip-detection
++		// latency). GTK_SEMA_SPIN_US is retired: the escalation point is now
++		// the base loop's own 500-lap spin budget.
++		static bool etk_sema_park_enabled()
++		{
++			static const bool enabled = []()
++			{
++				const char* v = std::getenv("GTK_SEMA_PARK");
++				return !(v && *v == '0');
++			}();
++			return enabled;
++		}
++
++		static u64 etk_sema_park_us()
++		{
++			static const u64 us = []() -> u64
++			{
++				if (const char* v = std::getenv("GTK_SEMA_PARK_US"))
++				{
++					const u64 parsed = std::strtoull(v, nullptr, 10);
++					if (parsed >= 50 && parsed <= 10'000) return parsed;
++				}
++				return 200;
++			}();
++			return us;
++		}
++
++		static bool etk_sema_park_flip_enabled()
++		{
++			static const bool enabled = []()
++			{
++				const char* v = std::getenv("GTK_SEMA_PARK_FLIP");
++				return v && *v == '1'; // hunt-rr7 fix-noflip: the flip park (v2) default OFF
++			}();
++			return enabled;
++		}
++
++		static u64 etk_sema_park_flip_us()
++		{
++			static const u64 us = []() -> u64
++			{
++				if (const char* v = std::getenv("GTK_SEMA_PARK_FLIP_US"))
++				{
++					const u64 parsed = std::strtoull(v, nullptr, 10);
++					if (parsed >= 50 && parsed <= 1'000) return parsed;
++				}
++				return 100;
++			}();
++			return us;
++		}
++
+ 		void set_reference(context* ctx, u32 /*reg*/, u32 arg)
+ 		{
+ 			RSX(ctx)->sync();
+@@ -64,6 +170,13 @@ namespace rsx
+ 			u64 last_check_val = start;
+ 			bool warned_slow = false;
+ 
++			// ETK semapark (doc block above): the flip semaphore parks under
++			// its own tighter bound; everything else under the standard one.
++			[[maybe_unused]] const bool etk_is_flip_sema = (addr == RSX(ctx)->label_addr + 0x10);
++			[[maybe_unused]] const bool etk_sema_park_eligible = etk_sema_park_enabled() && (!etk_is_flip_sema || etk_sema_park_flip_enabled());
++			[[maybe_unused]] const u64 etk_sema_park_period_us = etk_is_flip_sema ? etk_sema_park_flip_us() : etk_sema_park_us();
++			etk::g_sema_acquires++;
++
+ 			// Kept for the timeout log: lets a report distinguish a semaphore that
+ 			// changed after we started waiting from one that never moved at all.
+ 			const u32 first_observed = static_cast<u32>(sema);
+@@ -88,6 +201,8 @@ namespace rsx
+ 
+ 			while (true)
+ 			{
++				etk::g_sema_wakes++;
++
+ 				const RsxSemaphore observed = atomic_sema.observe();
+ 
+ 				if (observed == arg)
+@@ -196,6 +311,23 @@ namespace rsx
+ 				// period.
+ 				if (++spin_budget > 500)
+ 				{
++					// ETK semapark (doc block above): past the spin budget,
++					// take a real kernel sleep — a timed futex park — instead
++					// of idling the core in WFE. The futex old-value is the
++					// word's live bits (any change is a reason to re-check);
++					// nobody notifies this address, so the park returns at
++					// timeout (or on thread sync/task signals, which wait_on
++					// also arms) and the loop re-runs the full preamble.
++					// Unaligned semaphores stay on the base pacing: the futex
++					// word must be 4-byte aligned, same rule as the armed wait.
++					if (etk_sema_park_eligible && aligned)
++					{
++						(etk_is_flip_sema ? etk::g_sema_parks_flip : etk::g_sema_parks)++;
++						auto* etk_wait_word = utils::bless<atomic_t<u32>>(&const_cast<atomic_t<RsxSemaphore>&>(atomic_sema));
++						thread_ctrl::wait_on(*etk_wait_word, etk_wait_word->load(), etk_sema_park_period_us);
++						continue;
++					}
++
+ 					if (has_event_stream)
+ 					{
+ 						utils::wait_for_event();
+diff --git a/rpcs3/Emu/RSX/Overlays/overlay_perf_metrics.cpp b/rpcs3/Emu/RSX/Overlays/overlay_perf_metrics.cpp
+index 8ca290789..7498bb0c0 100644
+--- a/rpcs3/Emu/RSX/Overlays/overlay_perf_metrics.cpp
++++ b/rpcs3/Emu/RSX/Overlays/overlay_perf_metrics.cpp
+@@ -12,6 +12,83 @@
+ 
+ #include "util/cpu_stats.hpp"
+ 
++#include <cstdio>
++#include <ctime>
++
++// ETK semapark-v1 counters (Emu/RSX/NV47/HW/nv406e.cpp). Forward-declared to
++// keep RSX HW headers out of the overlay TU; linked from the same binary —
++// the vk::is_device_lost idiom.
++namespace rsx
++{
++	namespace etk
++	{
++		extern atomic_t<u64> g_sema_acquires;
++		extern atomic_t<u64> g_sema_wakes;
++		extern atomic_t<u64> g_sema_parks;
++		extern atomic_t<u64> g_sema_parks_flip;
++		// v0.7.4 (RSXThread.cpp): access-violation fault counters + ffs-v5
++		// flip retires.
++		extern atomic_t<u64> g_av_write_faults;
++		extern atomic_t<u64> g_av_read_faults;
++		extern atomic_t<u64> g_flip_retires;
++	}
++}
++
++namespace rsx
++{
++	namespace overlays
++	{
++		// ETK perf-stat SHM emit (v0.7.1, perfstat-v1). Mirror the overlay's OWN
++		// computed per-subsystem usage to /dev/shm so the ledger can attribute a
++		// slow frame (pack-bog: PPU/SPU/RSX split) with no GUI and no MangoHud.
++		// Same tmp+rename + bounded append-log pattern as the aud= emitter.
++		// fail-silent; Linux only (the rig). Values are exactly what the overlay
++		// draws, so ledger and screen can never disagree.
++		// semapark-v1 addendum: sq/sw/pk = SEMA PARK deltas since the previous
++		// emit (acquire-waits entered / wake iterations / futex parks) — the
++		// K1 instrument. sw collapsing toward pk = the spin is parking; a huge
++		// sw with pk=0 = kill-switch active or spin budget never reached.
++		static void etk_perf_stats_dump(f32 fps, f32 ft_ms, f32 cpu,
++			f32 ppu, f32 spu, f32 rsx, u32 rsx_load, u32 threads)
++		{
++#ifdef __linux__
++			static u64 prev_sq = 0, prev_sw = 0, prev_pk = 0, prev_pf = 0, prev_av = 0;
++			const u64 cur_sq = etk::g_sema_acquires.load();
++			const u64 cur_sw = etk::g_sema_wakes.load();
++			const u64 cur_pk = etk::g_sema_parks.load();
++			const u64 cur_pf = etk::g_sema_parks_flip.load();
++			const u64 cur_av = etk::g_av_write_faults.load() + etk::g_av_read_faults.load();
++			const u64 cur_fr = etk::g_flip_retires.load();
++			const u64 d_sq = cur_sq - prev_sq, d_sw = cur_sw - prev_sw, d_pk = cur_pk - prev_pk, d_pf = cur_pf - prev_pf, d_av = cur_av - prev_av;
++			prev_sq = cur_sq; prev_sw = cur_sw; prev_pk = cur_pk; prev_pf = cur_pf; prev_av = cur_av;
++
++			char line[352];
++			const int n = std::snprintf(line, sizeof(line),
++				"fps=%.1f ft_ms=%.2f cpu=%.1f ppu=%.1f spu=%.1f rsx=%.1f rsxload=%u thr=%u sq=%llu sw=%llu pk=%llu pf=%llu av=%llu fr=%llu\n",
++				fps, ft_ms, cpu, ppu, spu, rsx, rsx_load, threads,
++				static_cast<unsigned long long>(d_sq), static_cast<unsigned long long>(d_sw), static_cast<unsigned long long>(d_pk),
++				static_cast<unsigned long long>(d_pf), static_cast<unsigned long long>(d_av), static_cast<unsigned long long>(cur_fr));
++			if (n <= 0) return;
++
++			if (std::FILE* f = std::fopen("/dev/shm/rpcs3_perf_stat.tmp", "w"))
++			{
++				std::fwrite(line, 1, static_cast<usz>(n), f);
++				std::fclose(f);
++				std::rename("/dev/shm/rpcs3_perf_stat.tmp", "/dev/shm/rpcs3_perf_stat");
++			}
++
++			if (std::FILE* tl = std::fopen("/dev/shm/rpcs3_perf_log", "a"))
++			{
++				std::fseek(tl, 0, SEEK_END);
++				if (std::ftell(tl) < 2 * 1024 * 1024)
++					std::fprintf(tl, "ep=%llu %s", static_cast<unsigned long long>(std::time(nullptr)), line);
++				std::fclose(tl);
++			}
++#endif
++		}
++	}
++}
++
+ namespace rsx
+ {
+ 	namespace overlays
+@@ -578,6 +655,17 @@ namespace rsx
+ 					}
+ 				}
+ 
++				// ETK: mirror the just-computed frame split to SHM for the ledger.
++				// Detail=High is the only level where the full record is fresh
++				// (high -> medium fallthrough sets ppu/spu/rsx; high itself sets
++				// frametime/rsx_load/threads). Operator arms High via the Pitstop
++				// Perf Overlay dials for a pack/audio attribution stint.
++				if (m_detail == detail_level::high)
++				{
++					etk_perf_stats_dump(m_fps, m_frametime, m_cpu_usage,
++						m_ppu_usage, m_spu_usage, m_rsx_usage, m_rsx_load, m_total_threads);
++				}
++
+ 				// 2. Format output string
+ 				std::string perf_text;
+ 
+diff --git a/rpcs3/Emu/RSX/RSXTexture.cpp b/rpcs3/Emu/RSX/RSXTexture.cpp
+index a710d6639..df16c7e9a 100644
+--- a/rpcs3/Emu/RSX/RSXTexture.cpp
++++ b/rpcs3/Emu/RSX/RSXTexture.cpp
+@@ -244,6 +244,42 @@ namespace rsx
+ 	rsx::texture_channel_remap_t fragment_texture::decoded_remap() const
+ 	{
+ 		u32 remap_ctl = registers[NV4097_SET_TEXTURE_CONTROL1 + (m_index * 8)];
++
++		// ETK GTK experiment (11912 road-flicker, dossier Tier0_11912_ShadowRemapLocalization_20260702):
++		// GT5P parks its shadow-map TIU on a 1x1 fallback with a fully zeroed CONTROL1 (= FORCE-ZERO x4
++		// per the GCM enum) -> every track draw samples a constant-0 shadow-visibility term and the
++		// whole track renders shadowed; real hardware evidently treats the parked state as neutral.
++		// v2 (2026-07-02, after on-rig A/B): scoped to the exact confirmed signature — fully zeroed
++		// low word AND a 1x1 texture (on-rig probe showed the 1x1 is the ONLY zero-remap texture in
++		// live GT5P). Two decodes discriminate what console "neutral" means:
++		//   ONE x4            -> content-independent "no shadow" (kills content-staleness blips
++		//                        if the 1x1's texel is meaningless on console)
++		//   identity crossbar -> samples the 1x1's live content (correct if the game legitimately
++		//                        animates it as a global dimmer, e.g. tunnels)
++		// v1's blanket zero-control-field override caused short new flicker blips and is retired.
++		// v3 (0.6.0 GA): the ONE decode is ON BY DEFAULT — it is the hardware-matching
++		// interpretation (field-validated flicker-free, Eiger/Daytona) and the old opt-in gate
++		// was a leftover of the A/B bench, not a decision. Runtime controls:
++		//   GTK_REMAP0_ONE=0      -> kill-switch: stock zero-decode (diagnosis/regression A/B)
++		//   GTK_REMAP0_IDENTITY=1 -> identity-crossbar A/B variant
++		//   GTK_REMAP0_ONE=1      -> explicit ONE; outranks IDENTITY (preserves the v2 contract)
++		static const char* const s_gtk_remap0_env = std::getenv("GTK_REMAP0_ONE");
++		static const bool g_gtk_remap0_one_explicit = s_gtk_remap0_env && *s_gtk_remap0_env == '1';
++		static const bool g_gtk_remap0_off = s_gtk_remap0_env && *s_gtk_remap0_env == '0';
++		static const bool g_gtk_remap0_identity = []() { const char* e = std::getenv("GTK_REMAP0_IDENTITY"); return e && *e == '1'; }();
++		const bool gtk_use_identity = g_gtk_remap0_identity && !g_gtk_remap0_one_explicit;
++		if ((!g_gtk_remap0_off || g_gtk_remap0_identity) && (remap_ctl & 0xFFFF) == 0
++			&& width() <= 1 && height() <= 1) [[unlikely]]
++		{
++			static atomic_t<bool> s_logged = false;
++			if (!s_logged.exchange(true))
++			{
++				rsx_log.warning("GTK-REMAP0: %s override engaged (TIU%u raw=0x%08x)",
++					gtk_use_identity ? "identity" : "force-ONE", m_index, remap_ctl);
++			}
++			remap_ctl = (remap_ctl & 0xFFFF0000u) | (gtk_use_identity ? 0xAAE4u : 0x55E4u);
++		}
++
+ 		u32 remap_override = (remap_ctl >> 16) & 0xFFFF;
+ 
+ 		switch (format() & ~(CELL_GCM_TEXTURE_LN | CELL_GCM_TEXTURE_UN))
+diff --git a/rpcs3/Emu/RSX/RSXThread.cpp b/rpcs3/Emu/RSX/RSXThread.cpp
+index 01ed96d1b..d72077bb1 100644
+--- a/rpcs3/Emu/RSX/RSXThread.cpp
++++ b/rpcs3/Emu/RSX/RSXThread.cpp
+@@ -33,6 +33,8 @@
+ #include "Emu/Cell/lv2/sys_time.h"
+ #include "Emu/Cell/Modules/cellGcmSys.h"
+ #include "util/serialization_ext.hpp"
++
++#include <cstdlib>
+ #include "Overlays/overlay_perf_metrics.h"
+ #include "Overlays/overlay_debug_overlay.h"
+ #include "Overlays/overlay_manager.h"
+@@ -40,6 +42,7 @@
+ #include "Emu/system_progress.hpp"
+ 
+ #include "Utilities/date_time.h"
++#include "Emu/pitlink/pitlink.h"
+ 
+ #include "util/asm.hpp"
+ 
+@@ -130,6 +133,14 @@ bool serialize<rsx::rsx_iomap_table>(utils::serial& ar, rsx::rsx_iomap_table& o)
+ 	return true;
+ }
+ 
++// ffs-v5: forced-fence counter accessor (vkutils/sync.cpp). Forward-declared
++// to keep Vulkan headers out — the vk::is_device_lost linkage idiom.
++namespace vk
++{
++	u64 etk_fence_forced_count();
++	void mark_device_lost(); // tguard latch (vkutils/shared.cpp)
++}
++
+ namespace rsx
+ {
+ 	std::function<bool(u32 addr, bool is_writing)> g_access_violation_handler;
+@@ -1108,6 +1119,157 @@ namespace rsx
+ 		void set_render_mode(context* rsx, u32, u32 arg);
+ 	}
+ 
++	// ETK anti-lock stage 2 — the RSX progress watchdog (ffs-v3, 2026-07-06).
++	// Defeat Class #4, proven live twice in one day (GT HD Eiger + GT5P
++	// HSL-reverse, identical gdb signatures): a kernel keepalive rescue drops
++	// the faulting submit's guest-visible completion (ZCULL report / label),
++	// the game's render loop parks polling for it, the FIFO goes permanently
++	// EMPTY, and rsx idle-yields forever while the rest of the guest keeps
++	// simulating headless. No VkFence is stale, so the fence force-signal net
++	// is structurally blind here. THIS net watches FIFO progress instead:
++	//   stage A (idle > threshold, default 10 s, in-game, not paused):
++	//     log + zcull_ctrl->sync() — force-writes every claimed pending
++	//     report; a query killed by the rescue is forged to zero by the
++	//     GTK driver's TU_ETK_QUERY_SURVIVE instead of blocking, so the
++	//     sink write lands and the polling guest thread unparks.
++	//   stage B (still idle > 2x threshold): give up cleanly — Emu.Kill,
++	//     so the session self-recovers to a ledger row without an R3.
++	// Gated on GTK_RSX_WATCHDOG=1 (threshold override GTK_RSX_WATCHDOG_S);
++	// flag off = zero behavior change.
++	static bool etk_rsx_watchdog_enabled()
++	{
++		static const bool enabled = []()
++		{
++			const char* v = std::getenv("GTK_RSX_WATCHDOG");
++			return !(v && *v == '0'); // ETK v0.7.0: on by default; "0" = kill-switch
++		}();
++		return enabled;
++	}
++
++	static u64 etk_rsx_watchdog_threshold_us()
++	{
++		static const u64 threshold = []() -> u64
++		{
++			if (const char* v = std::getenv("GTK_RSX_WATCHDOG_S"))
++			{
++				if (const u64 s = std::strtoull(v, nullptr, 10))
++				{
++					return s * 1'000'000ull;
++				}
++			}
++			// 10 s: a healthy game never leaves the FIFO empty this long
++			// (menus, loading bars and replays all keep pushing); a class-4
++			// park is permanent, so extra latency only delays the rescue.
++			return 10'000'000ull;
++		}();
++		return threshold;
++	}
++
++	// ETK anti-lock stage 3b — FIFO-desync resync net (ffs-v4, 2026-07-06).
++	// Defeat Class #3 (FIFO-desync rsx-death), captured live with a full gdb
++	// bundle (manual_forensics/class3_fifodeath_*): a burst of kernel keepalive
++	// rescues drops many submits' guest-visible effects; the resulting FIFO
++	// desync STORM trips RPCS3's own "hopeless" give-up in recover_fifo() (20
++	// recoveries in < 2 s), which THROWS and kills rsx::thread. With rsx dead the
++	// guest deadlocks alive (SPUs parked in spu_thread::get_ch_value awaiting
++	// reports that never land). No VkFence is stale (ffs-v2 blind) and the FIFO
++	// never goes idle-EMPTY — it goes desynced-DEAD — so the ffs-v3 idle watchdog
++	// is blind too AND dies with the thread it rides. This net lives INSIDE
++	// recover_fifo: when the give-up would fire, force a ZCULL report sync (unpark
++	// the polling SPUs; a rescue-killed query is forged to zero by the GTK driver's
++	// TU_ETK_QUERY_SURVIVE instead of blocking) and run the existing queue-reset
++	// recovery instead of throwing, bounded to N consecutive give-ups; only if we
++	// still cannot make progress do we stop CLEANLY (ledger row, no R3) rather than
++	// freeze. Gated on GTK_FIFO_RESYNC=1 (budget override GTK_FIFO_RESYNC_TRIES);
++	// flag off = bit-for-bit stock throw. Composes with the keepalive kernel + the
++	// fence force-signal; it is the net for drops that CORRUPT the FIFO stream
++	// rather than merely STARVE it.
++	static bool etk_fifo_resync_enabled()
++	{
++		static const bool enabled = []()
++		{
++			const char* v = std::getenv("GTK_FIFO_RESYNC");
++			return !(v && *v == '0'); // ETK v0.7.0: on by default; "0" = kill-switch
++		}();
++		return enabled;
++	}
++
++	static u32 etk_fifo_resync_budget()
++	{
++		static const u32 budget = []() -> u32
++		{
++			if (const char* v = std::getenv("GTK_FIFO_RESYNC_TRIES"))
++			{
++				if (const u32 n = static_cast<u32>(std::strtoul(v, nullptr, 10)))
++				{
++					return n;
++				}
++			}
++			// 10 consecutive give-up hits (each = 20 rapid recoveries) rides out
++			// a keepalive submit-drop storm without an unbounded frozen spin.
++			return 10u;
++		}();
++		return budget;
++	}
++
++	namespace etk
++	{
++		// ETK v0.7.4 counters (perfstat-surfaced; overlay_perf_metrics.cpp
++		// extern-declares them — the vk::is_device_lost linkage idiom).
++		atomic_t<u64> g_flip_retires{0};    // ffs-v5 forced flip retires
++		atomic_t<u64> g_av_write_faults{0}; // access-violation write faults (VKGSRender)
++		atomic_t<u64> g_av_read_faults{0};  // access-violation read faults
++	}
++
++	// ETK anti-lock stage 4 — flip-status force-retire (ffs-v5, 2026-07-12,
++	// GTK Edition v0.7.4). The remaining ~50% RECOVERY share on 00E59005
++	// (N>=6 in one weekend): a keepalive rescue drops the submit whose
++	// completion would have flipped; flip_status stays WAITING forever and
++	// the guest parks in its cellGcmGetFlipStatus poll (GT5P EMAIN 0xbc92d0,
++	// lifted by ps3probe's flip lens). Nothing below can help — the fence
++	// force-signal nets operate at the Vulkan layer, but the guest-visible
++	// LOSS already happened. The retire runs on the rsx thread (the same
++	// thread handle_emu_flip runs on) and replays exactly its completion
++	// tail: flip_status -> DONE + fire the registered flip handler. Gated on
++	// a rescue having occurred inside the WAITING window (forced-fence count
++	// delta, stage-2 arming, or a FIFO-desync streak) so an organic long
++	// wait (loading screen) is never touched; GTK_FLIP_RETIRE_ANY=1 drops
++	// the gate for diagnosis. Default ON (house law), GTK_FLIP_RETIRE=0
++	// kill-switch, threshold GTK_FLIP_RETIRE_S (default 3 s).
++	static bool etk_flip_retire_enabled()
++	{
++		static const bool enabled = []()
++		{
++			const char* v = std::getenv("GTK_FLIP_RETIRE");
++			return !(v && *v == '0');
++		}();
++		return enabled;
++	}
++
++	static u64 etk_flip_retire_threshold_us()
++	{
++		static const u64 us = []() -> u64
++		{
++			if (const char* v = std::getenv("GTK_FLIP_RETIRE_S"))
++			{
++				const u64 parsed = std::strtoull(v, nullptr, 10);
++				if (parsed >= 1 && parsed <= 120) return parsed * 1'000'000;
++			}
++			return 3'000'000;
++		}();
++		return us;
++	}
++
++	static bool etk_flip_retire_any()
++	{
++		static const bool any = []()
++		{
++			const char* v = std::getenv("GTK_FLIP_RETIRE_ANY");
++			return v && *v == '1';
++		}();
++		return any;
++	}
++
+ 	void thread::on_task()
+ 	{
+ 		g_tls_log_prefix = []
+@@ -1356,6 +1518,15 @@ namespace rsx
+ 		// at no per-command cost.
+ 		RSX_PROF_SCOPE(fifo_decode);
+ 
++		// ETK anti-lock stage 2 state (see the doc block above on_task).
++		// 0 = armed, 1 = stage A fired (zcull force-sync done), 2 = gave up.
++		u32 etk_wd_stage = 0;
++
++		// ETK anti-lock stage 4 state (ffs-v5): the continuous flip-WAITING
++		// window and the rescue-counter snapshot taken when it opened.
++		u64 etk_flip_wait_mark = 0;
++		u64 etk_fence_forced_at_mark = 0;
++
+ 		while (!test_stopped())
+ 		{
+ 			// Wait for external pause events
+@@ -1411,6 +1582,103 @@ namespace rsx
+ 				{
+ 					m_host_dma_ctrl->update();
+ 				}
++
++				// ETK anti-lock stage 2 — RSX progress watchdog (doc block
++				// above on_task). Two u64 compares per 64 cycles when armed.
++				if (etk_rsx_watchdog_enabled() && int_flip_index > 0 && !Emu.IsPaused())
++				{
++					if (performance_counters.state == FIFO::state::running)
++					{
++						// FIFO progressed — re-arm.
++						etk_wd_stage = 0;
++					}
++					else if (etk_wd_stage < 2)
++					{
++						const u64 idle_us = get_system_time() - performance_counters.FIFO_idle_timestamp;
++						const u64 threshold = etk_rsx_watchdog_threshold_us();
++
++						if (etk_wd_stage == 0 && idle_us > threshold)
++						{
++							etk_wd_stage = 1;
++							rsx_log.error("ETK anti-lock stage2: FIFO starved for %llums in-game (state=%d get=0x%x put=0x%x flip#%llu) - forcing ZCULL report sync (post-rescue guest park suspected).",
++								idle_us / 1000, static_cast<u32>(performance_counters.state), +ctrl->get, +ctrl->put, int_flip_index);
++							// Force-write every claimed pending report. A query
++							// whose GPU work died in a keepalive rescue is forged
++							// to zero by the GTK driver (TU_ETK_QUERY_SURVIVE)
++							// instead of blocking this thread, so the guest's
++							// polled sink gets its write and can unpark.
++							zcull_ctrl->sync(this);
++							rsx_log.error("ETK anti-lock stage2: ZCULL sync returned - waiting for FIFO progress.");
++						}
++						else if (etk_wd_stage == 1 && idle_us > threshold * 2)
++						{
++							etk_wd_stage = 2;
++							rsx_log.fatal("ETK anti-lock stage2: FIFO still starved %llums after forced ZCULL sync - guest state is unrecoverable, stopping emulation cleanly (no R3 needed).",
++								idle_us / 1000);
++							Emu.Kill(false, false);
++						}
++					}
++				}
++
++				// ETK anti-lock stage 4 — flip-status force-retire (ffs-v5;
++				// doc block above the flag getters). Two compares per 64
++				// cycles when healthy.
++				if (etk_flip_retire_enabled() && int_flip_index > 0 && !Emu.IsPaused())
++				{
++					if (flip_status != CELL_GCM_DISPLAY_FLIP_STATUS_WAITING)
++					{
++						etk_flip_wait_mark = 0;
++					}
++					else if (!etk_flip_wait_mark)
++					{
++						etk_flip_wait_mark = get_system_time();
++						etk_fence_forced_at_mark = vk::etk_fence_forced_count();
++					}
++					else if (get_system_time() - etk_flip_wait_mark > etk_flip_retire_threshold_us())
++					{
++						const bool rescued = vk::etk_fence_forced_count() != etk_fence_forced_at_mark
++							|| etk_wd_stage != 0 || etk_fifo_dead_streak != 0;
++
++						if (rescued || etk_flip_retire_any())
++						{
++							const u64 n = ++etk::g_flip_retires;
++							rsx_log.error("ETK anti-lock stage4 (ffs-v5): guest flip WAITING %llums across a rescue - force-retiring flip status (retire #%llu, flip#%llu, forced_fences=%llu).",
++								(get_system_time() - etk_flip_wait_mark) / 1000, n, int_flip_index, vk::etk_fence_forced_count());
++
++							// Replay handle_emu_flip's completion tail: the
++							// status write the guest polls, then its flip
++							// handler interrupt. Same thread, same order.
++							flip_status = CELL_GCM_DISPLAY_FLIP_STATUS_DONE;
++
++							if (!isHLE)
++							{
++								sys_rsx_context_attribute(0x55555555, 0xFEC, current_display_buffer, 0, 0, 0);
++							}
++							else if (auto ptr = flip_handler)
++							{
++								intr_thread->cmd_list
++								({
++									{ ppu_cmd::set_args, 1 }, u64{ 1 },
++									{ ppu_cmd::lle_call, ptr },
++									{ ppu_cmd::sleep, 0 }
++								});
++
++								intr_thread->cmd_notify.store(1);
++								intr_thread->cmd_notify.notify_one();
++							}
++
++							etk_flip_wait_mark = 0;
++						}
++						else
++						{
++							// No rescue inside the window — an organic long
++							// wait (loading screen). Re-anchor so a LATER
++							// rescue is measured against a fresh window.
++							etk_flip_wait_mark = get_system_time();
++							etk_fence_forced_at_mark = vk::etk_fence_forced_count();
++						}
++					}
++				}
+ 			}
+ 
+ 			// Execute FIFO queue
+@@ -1420,6 +1688,16 @@ namespace rsx
+ 
+ 	void request_device_lost_shutdown(const char* reason)
+ 	{
++		// ETK tguard bridge (0.9.1 rebase onto ARMSX3 1.0.4): this base added its own
++		// device-loss path (these sites used to reach die_with_error, which is where the
++		// tguard latch was set). Latch ours too, BEFORE the fatal below, so every tguard
++		// consumer still sees the loss: the fatal-escalation Kill (rpcs3.cpp), the
++		// fast-teardown _Exit (Emulator::Kill, v6), quit-on-lost (v4), the stuck-join exit
++		// (Thread.cpp) and the swapchain teardown guard. The base's own policy -- a clean
++		// stop that leaves the app up -- is right for a GUI; a headless ROCKNIX launch needs
++		// the process to END so the frontend regains control. Idempotent CAS.
++		vk::mark_device_lost();
++
+ 		if (g_gpu_device_lost.exchange(true))
+ 		{
+ 			// Already latched. Every call site sees the dead device from here on, so this is
+@@ -2579,6 +2857,41 @@ namespace rsx
+ 			auto &tex = REGS(m_ctx)->fragment_textures[i];
+ 			current_fp_texture_state.clear(i);
+ 
++			// ETK GTK probe (11912 road-flicker): transition-gated TIU state log, enabled via
++			// GTK_PROBE_11912=1. The dim<->lit flip signature is the shadow-map TIU swapping
++			// depth<->color class with a zeroed CONTROL1 remap-control field
++			// (dossier Tier0_11912_ShadowRemapLocalization_20260702).
++			// RESTORED 2026-08-05: silently dropped in the 0.7.x consolidation and absent
++			// from 0.7.5-0.8.3; scripts/verify-markers.sh now guards it.
++			static const bool g_gtk_probe_11912 = []() { const char* e = std::getenv("GTK_PROBE_11912"); return e && *e == '1'; }();
++			if (g_gtk_probe_11912) [[unlikely]]
++			{
++				static u32 s_last_remap[16] = {};
++				static u32 s_last_state[16] = {};
++				static u32 s_last_texel[16] = {};
++				const u32 raw_remap = tex.remap();
++				const u32 state = (static_cast<u32>(sampler_descriptors[i]->format_class) << 1) | (tex.enabled() ? 1u : 0u);
++				// v2: for the parked-shadow 1x1 (zero remap), also watch the guest texel's
++				// live CONTENT — discriminates game-animated dimmer vs stale cache vs static.
++				u32 texel = 0;
++				if (raw_remap == 0 && tex.width() <= 1 && tex.height() <= 1)
++				{
++					if (const u32 texaddr = get_address(tex.offset(), tex.location(), 4))
++					{
++						texel = vm::_ref<const u32>(texaddr);
++					}
++				}
++				if (s_last_remap[i] != raw_remap || s_last_state[i] != state || s_last_texel[i] != texel)
++				{
++					rsx_log.warning("GTK-PROBE-11912 TIU%u: remap=0x%08x class=%u enabled=%u dims=%ux%u zfunc=%u fmt=0x%x texel=0x%08x",
++						i, raw_remap, static_cast<u32>(sampler_descriptors[i]->format_class), tex.enabled() ? 1u : 0u,
++						tex.width(), tex.height(), static_cast<u32>(tex.zfunc()), static_cast<u32>(tex.format()), texel);
++					s_last_remap[i] = raw_remap;
++					s_last_state[i] = state;
++					s_last_texel[i] = texel;
++				}
++			}
++
+ 			if (!tex.enabled() || sampler_descriptors[i]->format_class == RSX_FORMAT_CLASS_UNDEFINED)
+ 			{
+ 				continue;
+@@ -2937,6 +3250,10 @@ namespace rsx
+ 		{
+ 			performance_counters.sampled_frames++;
+ 
++			// ETK GTK Pitlink CLOCK: one tick per GAME flip (flip counter, fps, STEP budget),
++			// beside upstream's own pause-after-N-flips -- native-UI flips never tick it.
++			pitlink::on_flip();
++
+ 			if (m_pause_after_x_flips && m_pause_after_x_flips-- == 1)
+ 			{
+ 				Emu.Pause();
+@@ -3185,7 +3502,16 @@ namespace rsx
+ 
+ 	void thread::recover_fifo(std::source_location src_loc)
+ 	{
+-		bool kill_itself = g_cfg.core.rsx_fifo_accuracy == rsx_fifo_mode::as_ps3;
++		// Config-driven strict death (RSX FIFO Accuracy = "PS3"): the user asked
++		// for accurate die-on-desync — ETK never overrides this.
++		const bool cfg_kill = g_cfg.core.rsx_fifo_accuracy == rsx_fifo_mode::as_ps3;
++		bool kill_itself = cfg_kill;
++
++		// Storm-driven give-up: 20 recoveries inside ~2 s = "probably hopeless".
++		// This is the branch a keepalive submit-drop burst trips (see the
++		// ffs-v4 doc block above). Tracked separately so the ETK net only ever
++		// touches THIS give-up, never the config-accurate one.
++		bool storm_kill = false;
+ 
+ 		const u64 current_time = get_system_time();
+ 
+@@ -3198,13 +3524,52 @@ namespace rsx
+ 			if (current_time - cmd_info.timestamp < 2'000'000u - std::min<u32>(g_cfg.video.driver_wakeup_delay * 700, 1'400'000))
+ 			{
+ 				// Probably hopeless
+-				kill_itself = true;
++				storm_kill = true;
+ 			}
+ 
+ 			// Erase the last command from history, keep the size of the queue the same
+ 			recovered_fifo_cmds_history.pop();
+ 		}
+ 
++		// ETK anti-lock stage 3b (ffs-v4): intercept the storm give-up before it
++		// throws and kills rsx::thread. Only the storm branch, and only when the
++		// config did not itself ask to die.
++		if (etk_fifo_resync_enabled() && storm_kill && !cfg_kill)
++		{
++			if (++etk_fifo_dead_streak > etk_fifo_resync_budget())
++			{
++				rsx_log.fatal("ETK anti-lock stage3b: FIFO desync unrecoverable after %u forced resyncs (keepalive submit-drop storm) - stopping emulation cleanly (no R3 needed).",
++					etk_fifo_dead_streak);
++				Emu.Kill(false, false);
++				// Fall through to the queue reset so this thread unwinds tidily;
++				// the run_FIFO loop's test_stopped() then exits it. Do NOT throw.
++				storm_kill = false;
++			}
++			else
++			{
++				rsx_log.error("ETK anti-lock stage3b: dead-FIFO give-up suppressed (%u/%u) - forcing ZCULL report sync + queue resync to get=0x%x, continuing.",
++					etk_fifo_dead_streak, etk_fifo_resync_budget(), restore_point);
++				// Force-write every claimed pending report so SPUs parked in
++				// get_ch_value (awaiting a report the dropped submit never wrote)
++				// unpark. A query whose GPU work died in a keepalive rescue is
++				// forged to zero by the GTK driver (TU_ETK_QUERY_SURVIVE) instead
++				// of blocking this thread.
++				if (zcull_ctrl)
++				{
++					zcull_ctrl->sync(this);
++				}
++				// Suppress the throw; fall through to the queue reset below.
++				storm_kill = false;
++			}
++		}
++		else if (!storm_kill)
++		{
++			// Recoveries have spread out (real progress between them) — re-arm.
++			etk_fifo_dead_streak = 0;
++		}
++
++		kill_itself = cfg_kill || storm_kill;
++
+ 		if (kill_itself)
+ 		{
+ 			fmt::throw_exception("Dead FIFO commands queue state has been detected!"
+diff --git a/rpcs3/Emu/RSX/RSXThread.h b/rpcs3/Emu/RSX/RSXThread.h
+index 89b94f07f..d901d9a1e 100644
+--- a/rpcs3/Emu/RSX/RSXThread.h
++++ b/rpcs3/Emu/RSX/RSXThread.h
+@@ -333,6 +333,10 @@ namespace rsx
+ 		bool in_begin_end = false;
+ 
+ 		std::queue<desync_fifo_cmd_info> recovered_fifo_cmds_history;
++		// ETK anti-lock stage 3b (ffs-v4): consecutive "hopeless" FIFO-desync
++		// give-ups suppressed by GTK_FIFO_RESYNC before a clean stop. Reset on
++		// progress. See recover_fifo() in RSXThread.cpp.
++		u32 etk_fifo_dead_streak = 0;
+ 		std::deque<frame_time_t> frame_times;
+ 		u32 prevent_preempt_increase_tickets = 0;
+ 		u64 preempt_fail_old_preempt_count = 0;
+diff --git a/rpcs3/Emu/RSX/VK/VKFrameGen.cpp b/rpcs3/Emu/RSX/VK/VKFrameGen.cpp
+index 31e4ec773..2442ec345 100644
+--- a/rpcs3/Emu/RSX/VK/VKFrameGen.cpp
++++ b/rpcs3/Emu/RSX/VK/VKFrameGen.cpp
+@@ -825,7 +825,11 @@ namespace vk::frame_gen
+ 	}
+ 
+ #else
+-	bool capture_presented_frame(const vk::command_buffer&, const vk::render_device&, VkImage, VkImageLayout, u32, u32)
++	// ETK 0.9.0.1: signature matched to the header -- upstream widened the
++	// real function to carry guest_width/guest_height but left this desktop
++	// stub on the old six-parameter form, which linked as a different
++	// overload and left the real symbol undefined.
++	bool capture_presented_frame(const vk::command_buffer&, const vk::render_device&, VkImage, VkImageLayout, u32, u32, u32, u32)
+ 	{
+ 		return false;
+ 	}
+diff --git a/rpcs3/Emu/RSX/VK/VKGSRender.cpp b/rpcs3/Emu/RSX/VK/VKGSRender.cpp
+index 2724212ed..8de63e8aa 100644
+--- a/rpcs3/Emu/RSX/VK/VKGSRender.cpp
++++ b/rpcs3/Emu/RSX/VK/VKGSRender.cpp
+@@ -909,6 +909,9 @@ VKGSRender::~VKGSRender()
+ 	// boot in the same process reused the stale handles because the stack still looked valid.
+ 	vk::frame_gen::release_device_resources();
+ 
++	// ETK GTK Pitlink tap image + ring buffers: children of this device, released while it lives.
++	pitlink_release();
++
+ 	// Globals. TODO: Refactor lifetime management
+ 	if (auto async_scheduler = g_fxo->try_get<vk::AsyncTaskScheduler>())
+ 	{
+@@ -1014,6 +1017,49 @@ VKGSRender::~VKGSRender()
+ #endif
+ }
+ 
++// ETK avwiden-v1 counters (defined in RSXThread.cpp namespace rsx::etk;
++// surfaced on the perfstat line by overlay_perf_metrics.cpp).
++namespace rsx
++{
++	namespace etk
++	{
++		extern atomic_t<u64> g_av_write_faults;
++		extern atomic_t<u64> g_av_read_faults;
++	}
++}
++
++// ETK avwiden-v1 (2026-07-12, GTK Edition v0.7.4). Evidence: GT HD at
++// LOCKED-60 burns 13.3 / 20.5 / 14.8% of ALL process cycles (three bog
++// samples, 2026-07-12) inside this handler — one PPU thread streaming
++// writes through texture-cache-protected pages, faulting page by page,
++// every frame. Mitigation: on a WRITE fault, additionally invalidate a
++// readahead span AHEAD of the faulting page so a linear writer takes one
++// fault per span instead of one per 4K page. Correctness: invalidation is
++// conservative by construction (worst case = extra texture revalidation);
++// the faulting page itself KEEPS the stock single-address call, preserving
++// exact violation_handled semantics (a widened-range hit on a neighbor
++// must never report the fault page as handled — that would refault
++// forever). Read faults stay precise (widening a read fault could flush
++// render targets wholesale). Default ON at 65536 (16 pages);
++// GTK_AV_READAHEAD=0 kill-switch, or a byte count (4K..16M, page-rounded).
++namespace
++{
++	u32 etk_av_readahead_bytes()
++	{
++		static const u32 bytes = []() -> u32
++		{
++			if (const char* v = std::getenv("GTK_AV_READAHEAD"))
++			{
++				const u64 parsed = std::strtoull(v, nullptr, 10);
++				if (parsed == 0) return 0;
++				if (parsed >= 4096 && parsed <= 16u * 1024 * 1024) return static_cast<u32>(parsed & ~0xfffull);
++			}
++			return 65536;
++		}();
++		return bytes;
++	}
++}
++
+ bool VKGSRender::on_access_violation(u32 address, bool is_writing)
+ {
+ 	RSX_PROF_SCOPE(texcache_lookup);
+@@ -1049,7 +1095,25 @@ bool VKGSRender::on_access_violation(u32 address, bool is_writing)
+ 	vk::texture_cache::thrashed_set result;
+ 	{
+ 		const rsx::invalidation_cause cause = is_writing ? rsx::invalidation_cause::deferred_write : rsx::invalidation_cause::deferred_read;
++		(is_writing ? rsx::etk::g_av_write_faults : rsx::etk::g_av_read_faults)++;
+ 		result = m_texture_cache.invalidate_address(*m_secondary_cb_list.get(), address, cause);
++
++		// avwiden-v1 (doc block above): opportunistic readahead invalidation
++		// for the pages a linear writer will hit next. Result deliberately
++		// ignored — the stock call above owns violation_handled.
++		if (const u32 widen = etk_av_readahead_bytes(); widen && is_writing)
++		{
++			const u32 next_page = (address & ~0xfffu) + 0x1000;
++			if (next_page > address) // no wrap at the top of the address space
++			{
++				const u32 span = static_cast<u32>(std::min<u64>(widen, 0x1'0000'0000ull - next_page));
++				if (span)
++				{
++					m_texture_cache.invalidate_range(*m_secondary_cb_list.get(),
++						utils::address_range32::start_length(next_page, span), cause);
++				}
++			}
++		}
+ 	}
+ 
+ 	if (result.invalidate_samplers)
+diff --git a/rpcs3/Emu/RSX/VK/VKGSRender.h b/rpcs3/Emu/RSX/VK/VKGSRender.h
+index 0aee43f0d..2748a1787 100644
+--- a/rpcs3/Emu/RSX/VK/VKGSRender.h
++++ b/rpcs3/Emu/RSX/VK/VKGSRender.h
+@@ -21,6 +21,8 @@
+ 
+ #include "Emu/RSX/GSRender.h"
+ #include "Emu/RSX/Host/RSXDMAWriter.h"
++#include "Emu/pitlink/pitlink.h"
++#include <array>
+ #include <functional>
+ #include <initializer_list>
+ 
+@@ -248,6 +250,22 @@ private:
+ 
+ 	std::unique_ptr<vk::image> m_overlay_recording_img;
+ 
++	// ETK GTK Pitlink EYES: a downscaled copy of the flipped image, read back with no GPU stall.
++	// Recorded into the frame's own command buffer and harvested in frame_context_cleanup, after
++	// the wait that frame already pays -- never a flush_command_queue(true), which is what the
++	// screenshot/recording path costs per captured frame.
++	struct pitlink_tap_slot
++	{
++		std::unique_ptr<vk::buffer> buf;
++		vk::frame_context_t* ctx = nullptr;
++		pitlink::frame_ticket ticket;
++		u32 width = 0;
++		u32 height = 0;
++		bool busy = false;
++	};
++	std::unique_ptr<vk::image> m_pitlink_tap_img;
++	std::array<pitlink_tap_slot, 3> m_pitlink_slots;
++
+ 	//Vertex layout
+ 	rsx::vertex_input_layout m_vertex_layout;
+ 
+@@ -277,6 +295,10 @@ private:
+ 	void flush_command_queue(bool hard_sync = false, bool do_not_switch = false);
+ 	void queue_swap_request();
+ 	void frame_context_cleanup(vk::frame_context_t *ctx);
++	bool pitlink_record_tap(vk::image* src, u32 region_w, u32 region_h, pitlink::frame_ticket& ticket);
++	void pitlink_harvest(vk::frame_context_t* ctx, bool retired);
++	void pitlink_harvest_all();
++	void pitlink_release();
+ 	void advance_queued_frames();
+ 	void present(vk::frame_context_t *ctx);
+ 	vk::command_buffer_chunk* present_generated_frame(VkImage src);
+diff --git a/rpcs3/Emu/RSX/VK/VKGSRenderTypes.hpp b/rpcs3/Emu/RSX/VK/VKGSRenderTypes.hpp
+index 1ea996f02..0a290888f 100644
+--- a/rpcs3/Emu/RSX/VK/VKGSRenderTypes.hpp
++++ b/rpcs3/Emu/RSX/VK/VKGSRenderTypes.hpp
+@@ -126,6 +126,31 @@ namespace vk
+ 				if (fence_status != VK_SUCCESS) rsx::prof::g_fence_polls_not_ready++;
+ 			}
+ 
++			if (fence_status != VK_SUCCESS)
++			{
++				// ETK fence force-signal: this is the ONE poll site outside
++				// wait_for_fence — the hard-sync present-queue drain
++				// (`while (!m_queued_frames.empty()) check_present_status();`)
++				// spins HERE with no timeout and no escalation. Live-proven
++				// 2026-07-05 (GT HD, 00E5 flip wedge): post-hangcheck this
++				// fence never signals and the drain spins forever. Age the
++				// fence; at the threshold, drive through the normal
++				// completion path below exactly as if it signaled.
++				// (Leapfrog note: this base asks with vkWaitForFences(t=0),
++				// so not-ready arrives as VK_TIMEOUT rather than
++				// VK_NOT_READY — the aging keys off "anything but SUCCESS".
++				// The prof counters above keep counting the RAW driver
++				// answer; a forced completion is not a poll success.)
++				if (vk::etk_fence_note_not_ready(m_submit_fence))
++				{
++					fence_status = VK_SUCCESS;
++				}
++			}
++			else
++			{
++				vk::etk_fence_note_signaled(m_submit_fence);
++			}
++
+ 			if (fence_status == VK_SUCCESS)
+ 			{
+ 				lock.upgrade();
+diff --git a/rpcs3/Emu/RSX/VK/VKPresent.cpp b/rpcs3/Emu/RSX/VK/VKPresent.cpp
+index 520d3022b..979410e42 100644
+--- a/rpcs3/Emu/RSX/VK/VKPresent.cpp
++++ b/rpcs3/Emu/RSX/VK/VKPresent.cpp
+@@ -1,11 +1,14 @@
+ #include "stdafx.h"
+ #include "VKGSRender.h"
+ #include "VKFrameGen.h"
++#include "vkutils/barriers.h"
+ #include "vkutils/buffer_object.h"
+ #include "vkutils/memory.h"
++#include "vkutils/shared.h"
+ #include "Emu/RSX/Overlays/overlay_manager.h"
+ #include "Emu/RSX/Overlays/overlay_debug_overlay.h"
+ #include "Emu/Cell/Modules/cellVideoOut.h"
++#include "Emu/System.h"
+ #include "Emu/RSX/rsx_profiler.h"
+ #include "vkutils/gpu_timer.h"
+ 
+@@ -161,6 +164,14 @@ bool VKGSRender::reinitialize_swapchain()
+ 	m_current_queue_index = 0;
+ 	m_frame_context_storage.clear();
+ 
++	// Pitlink taps tagged with the contexts just destroyed can never be harvested; free them.
++	for (auto& slot : m_pitlink_slots)
++	{
++		slot.ticket = {};
++		slot.busy = false;
++		slot.ctx = nullptr;
++	}
++
+ 	// The frame frame generation was holding back lives in the storage just cleared, and its
+ 	// swapchain image belongs to the swapchain about to be destroyed. There is nothing left to
+ 	// present it to, so drop it rather than carry a pointer into freed contexts.
+@@ -239,7 +250,31 @@ bool VKGSRender::reinitialize_swapchain()
+ 
+ 	// Flush the command buffer
+ 	if (rsx::prof::enabled()) [[unlikely]] rsx::prof::g_flush_sites[13]++; close_and_submit_command_buffer(&resize_fence);
+-	vk::wait_for_fence(&resize_fence);
++	// ETK Tier 1 (787B reframe / Lead D, gt5p-boss-lsd-iteration 2026-07-01):
++	// second call site for the same fix as commands.cpp's command_buffer::begin().
++	// This was an unbounded wait_for_fence(&resize_fence) (default timeout=0) -
++	// live-confirmed 2026-07-01: a real a6xx fault (status=00E79587) left
++	// rsx::thread busy-spinning HERE, not at the commands.cpp site Tier 1
++	// originally patched, so the first patch alone didn't catch this hang.
++	// The boss can wedge at either fence wait depending on where in the frame
++	// (mid-draw vs. swapchain resize) it lands when the GPU is lost.
++	// (Leapfrog note: this base's timeout=0 path now blocks in 1 s driver
++	// slices instead of spinning — cheaper, and abandonable on stop, but
++	// still without escalation, so the bounded wait + clean stop keeps its
++	// purpose.)
++	const VkResult wait_result = vk::wait_for_fence(&resize_fence, GENERAL_WAIT_TIMEOUT);
++	if (wait_result != VK_SUCCESS) [[unlikely]]
++	{
++		// Do NOT proceed to reset()/reuse the command buffer or swapchain state -
++		// the prior submission's GPU work is in an unknown state (timed out or
++		// the device is lost), so continuing now would race a still-possibly-
++		// live submission or corrupt state on the next frame.
++		rsx_log.fatal("GPU fence wait failed (VkResult=%d) after %uus during swapchain reinit - GPU is likely hung or lost. Stopping emulation.",
++			static_cast<s32>(wait_result), static_cast<u32>(GENERAL_WAIT_TIMEOUT));
++		vk::mark_device_lost();
++		Emu.Kill(false, false);
++		return false;
++	}
+ 
+ 	m_current_command_buffer->reset();
+ 	m_current_command_buffer->begin();
+@@ -490,6 +525,8 @@ void VKGSRender::present(vk::frame_context_t *ctx)
+ 		default:
+ 			// Other errors not part of rpcs3. This can be caused by 3rd party injectors with bad code, of which we have no control over.
+ 			// Let the application attempt to recover instead of crashing outright.
++			// (ETK: VK_ERROR_DEVICE_LOST no longer reaches here -- the base's own case above
++			// takes it, and request_device_lost_shutdown latches tguard; see RSXThread.cpp.)
+ 			rsx_log.error("VkPresent returned unexpected error code %lld. Will attempt to recreate the swapchain. Please disable 3rd party injector tools.", static_cast<s64>(error));
+ 			swapchain_unavailable = true;
+ 			break;
+@@ -867,6 +904,7 @@ void VKGSRender::frame_context_cleanup(vk::frame_context_t *ctx)
+ 	if (rsx::prof::enabled()) [[unlikely]] rsx::prof::g_frame_cleanups++;
+ 
+ 	// Perform hard swap here
++	bool swap_retired = true;
+ 	{
+ 		// Split from the reclaim below because the two mean opposite things: time here is the
+ 		// RSX thread blocked on the GPU, time below is the RSX thread doing CPU work. Both
+@@ -877,9 +915,14 @@ void VKGSRender::frame_context_cleanup(vk::frame_context_t *ctx)
+ 		{
+ 			// Lost surface/device, release swapchain
+ 			swapchain_unavailable = true;
++			swap_retired = false;
+ 		}
+ 	}
+ 
++	// ETK GTK Pitlink: this frame's GPU work has retired -- the wait above is the frame's own,
++	// already paid -- so a tap it carried is readable now, at no extra sync.
++	pitlink_harvest(ctx, swap_retired);
++
+ 	// Resource cleanup.
+ 	{
+ 		RSX_PROF_SCOPE(res_trim);
+@@ -1584,6 +1627,36 @@ void VKGSRender::flip(const rsx::display_flip_info_t& info)
+ 		}
+ 	}
+ 
++	// ETK GTK Pitlink EYES: asynchronous by construction (see pitlink_record_tap).
++	if (image_to_flip && pitlink::enabled())
++	{
++		if (pitlink::frame_ticket ticket = pitlink::want_frame(info.emu_flip); ticket.valid)
++		{
++			const bool sync = ticket.sync;
++
++			if (sync)
++			{
++				// Nothing will harvest this frame later -- the frame a STEP stops on (a paused
++				// RSX thread never reaches frame_context_cleanup) or a SNAP served while paused --
++				// so read it back now. Drain the ring first so a slot is free. Same spot and same
++				// rule as the media-capture block above (before the acquired image is touched);
++				// only ever paid on a lockstep boundary or a paused SNAP, never in a measured run.
++				flush_command_queue(true);
++				pitlink_harvest_all();
++			}
++
++			if (!pitlink_record_tap(image_to_flip, buffer_width, buffer_height, ticket))
++			{
++				pitlink::requeue(std::move(ticket)); // no free slot: a SNAP is re-armed, not lost
++			}
++			else if (sync)
++			{
++				flush_command_queue(true);
++				pitlink_harvest(m_current_frame, true);
++			}
++		}
++	}
++
+ 	// Coverage, not just inset.
+ 	//
+ 	// target_layout is now UNDEFINED on the WSI path, so any pixel the blit does not write is
+@@ -1931,3 +2004,166 @@ void VKGSRender::flip(const rsx::display_flip_info_t& info)
+ 		}
+ 	}
+ }
++
++// ETK GTK Pitlink EYES -----------------------------------------------------------------------
++//
++// One downscale blit + one image->buffer copy, recorded into the command buffer that carries
++// this frame. No fence is polled and nothing is flushed here: the copy is read back in
++// frame_context_cleanup, after the swap wait the frame pays anyway (on this driver even a
++// fence poke blocks -- see advance_queued_frames). Three ring slots; when all three are still
++// in flight the frame is skipped, because vision wants the newest frame, not a backlog.
++bool VKGSRender::pitlink_record_tap(vk::image* src, u32 region_w, u32 region_h, pitlink::frame_ticket& ticket)
++{
++	pitlink_tap_slot* slot = nullptr;
++	for (auto& candidate : m_pitlink_slots)
++	{
++		if (!candidate.busy)
++		{
++			slot = &candidate;
++			break;
++		}
++	}
++
++	if (!slot)
++	{
++		return false;
++	}
++
++	// The displayed region, not the whole surface: get_present_source accepts surfaces larger
++	// than the display buffer (fit-or-crop, stereo stacks both eyes), and buffer_width x
++	// buffer_height is what the present blit and the screenshot path take from it.
++	const u32 src_w = std::min(src->width(), region_w ? region_w : src->width());
++	const u32 src_h = std::min(src->height(), region_h ? region_h : src->height());
++	if (!src_w || !src_h)
++	{
++		return false;
++	}
++	const bool native = ticket.full || !ticket.width || !ticket.height;
++	const u32 dst_w = native ? src_w : std::clamp<u32>(ticket.width, 1, src_w);
++	const u32 dst_h = native ? src_h : std::clamp<u32>(ticket.height, 1, src_h);
++	const usz size = usz{dst_w} * dst_h * 4;
++
++	if (!m_pitlink_tap_img || m_pitlink_tap_img->width() != dst_w || m_pitlink_tap_img->height() != dst_h)
++	{
++		if (m_pitlink_tap_img)
++		{
++			vk::get_resource_manager()->dispose(m_pitlink_tap_img);
++		}
++
++		m_pitlink_tap_img = std::make_unique<vk::image>(*m_device, m_device->get_memory_mapping().device_local, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
++			VK_IMAGE_TYPE_2D, VK_FORMAT_B8G8R8A8_UNORM, dst_w, dst_h, 1, 1, 1, VK_SAMPLE_COUNT_1_BIT,
++			VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
++			0, VMM_ALLOCATION_POOL_SYSTEM);
++	}
++
++	if (!slot->buf || slot->buf->size() < size)
++	{
++		// Through the deferred collector, not in place: a slot freed by a failed swap wait may
++		// still have its copy in flight.
++		if (slot->buf)
++		{
++			vk::get_resource_manager()->dispose(slot->buf);
++		}
++		slot->buf = std::make_unique<vk::buffer>(*m_device, utils::align(size, 0x100000), m_device->get_memory_mapping().host_visible_coherent,
++			VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, VK_BUFFER_USAGE_TRANSFER_DST_BIT, 0, VMM_ALLOCATION_POOL_UNDEFINED);
++	}
++
++	const vk::command_buffer& cmd = *m_current_command_buffer;
++
++	src->push_layout(cmd, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
++	m_pitlink_tap_img->change_layout(cmd, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
++
++	VkImageBlit blit{};
++	blit.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
++	blit.srcOffsets[1] = { static_cast<s32>(src_w), static_cast<s32>(src_h), 1 };
++	blit.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
++	blit.dstOffsets[1] = { static_cast<s32>(dst_w), static_cast<s32>(dst_h), 1 };
++	vkCmdBlitImage(cmd, src->value, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, m_pitlink_tap_img->value, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
++		1, &blit, (dst_w == src_w && dst_h == src_h) ? VK_FILTER_NEAREST : VK_FILTER_LINEAR);
++
++	src->pop_layout(cmd);
++	m_pitlink_tap_img->change_layout(cmd, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
++
++	VkBufferImageCopy copy_info{};
++	copy_info.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
++	copy_info.imageExtent = { dst_w, dst_h, 1 };
++	vk::copy_image_to_buffer(cmd, m_pitlink_tap_img.get(), slot->buf.get(), copy_info);
++
++	// Make the transfer visible to the host read in pitlink_harvest.
++	vk::insert_buffer_memory_barrier(cmd, slot->buf->value, 0, size,
++		VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
++
++	slot->ctx = m_current_frame;
++	slot->ticket = std::move(ticket);
++	slot->width = dst_w;
++	slot->height = dst_h;
++	slot->busy = true;
++	return true;
++}
++
++// Only after a hard sync, when every recorded tap has retired. Normally a no-op -- the sync's own
++// frame_context_cleanup pass already harvested them -- kept so no slot can survive into the
++// synchronous tap that follows (oldest first, so that tap is the newest frame the server holds).
++void VKGSRender::pitlink_harvest_all()
++{
++	std::array<pitlink_tap_slot*, 3> order{};
++	usz n = 0;
++	for (auto& slot : m_pitlink_slots)
++	{
++		if (slot.busy)
++		{
++			order[n++] = &slot;
++		}
++	}
++
++	std::sort(order.begin(), order.begin() + n, [](const pitlink_tap_slot* a, const pitlink_tap_slot* b)
++	{
++		return a->ticket.flip < b->ticket.flip;
++	});
++
++	for (usz i = 0; i < n; i++)
++	{
++		if (order[i]->busy)
++		{
++			pitlink_harvest(order[i]->ctx, true);
++		}
++	}
++}
++
++void VKGSRender::pitlink_harvest(vk::frame_context_t* ctx, bool retired)
++{
++	for (auto& slot : m_pitlink_slots)
++	{
++		if (!slot.busy || slot.ctx != ctx)
++		{
++			continue;
++		}
++
++		if (retired && slot.buf)
++		{
++			const usz size = usz{slot.width} * slot.height * 4;
++			const auto* pixels = static_cast<const u8*>(slot.buf->map(0, size));
++			pitlink::submit_frame(std::move(slot.ticket), pixels, slot.width, slot.height, true);
++			slot.buf->unmap();
++		}
++
++		slot.ticket = {};
++		slot.busy = false;
++		slot.ctx = nullptr;
++	}
++}
++
++// Children of the device: released by the destructor right after vkDeviceWaitIdle, never left
++// to implicit member destruction (0.9.1.2 was an exit abort of exactly that ordering class).
++void VKGSRender::pitlink_release()
++{
++	for (auto& slot : m_pitlink_slots)
++	{
++		slot.buf.reset();
++		slot.ticket = {};
++		slot.busy = false;
++		slot.ctx = nullptr;
++	}
++
++	m_pitlink_tap_img.reset();
++}
+diff --git a/rpcs3/Emu/RSX/VK/VKQueryPool.cpp b/rpcs3/Emu/RSX/VK/VKQueryPool.cpp
+index 0e0bd36ef..a8d14ae8c 100644
+--- a/rpcs3/Emu/RSX/VK/VKQueryPool.cpp
++++ b/rpcs3/Emu/RSX/VK/VKQueryPool.cpp
+@@ -244,7 +244,7 @@ namespace vk
+ 					}
+ 				}
+ 
+-#ifdef __ANDROID__
++#if defined(__ANDROID__) || defined(ETK_CONSTRAINED_HOST)
+ 				// Spin briefly, then hand the core back.
+ 				//
+ 				// A pure pause() spin is reasonable on a desktop, where the result lands in
+diff --git a/rpcs3/Emu/RSX/VK/VKResolveHelper.cpp b/rpcs3/Emu/RSX/VK/VKResolveHelper.cpp
+index 74a7752cc..0a986b227 100644
+--- a/rpcs3/Emu/RSX/VK/VKResolveHelper.cpp
++++ b/rpcs3/Emu/RSX/VK/VKResolveHelper.cpp
+@@ -457,6 +457,18 @@ namespace vk
+ 			g_gfx_shuffle.reset();
+ 		}
+ 
++		// ETK: the 32-bit twin (85b7495b9) was never torn down here. Once a session had run a
++		// 32-bit byteswap on the graphics pipe, the pass -- and its overlays UBO (8 MiB) and VAO
++		// (1 MiB) heaps -- outlived the device: "Leaking memory allocations" at teardown, then its
++		// static destructor called vkDestroyBuffer on the destroyed VkDevice, the loader aborted
++		// ("Invalid device"), and the kernel wrote a multi-GB core to the SD card while the rig
++		// sat on a frozen screen for up to 74 minutes after every such graceful exit.
++		if (g_gfx_shuffle_32)
++		{
++			g_gfx_shuffle_32->destroy();
++			g_gfx_shuffle_32.reset();
++		}
++
+ 		for (auto &task : g_resolve_helpers)
+ 		{
+ 			task.second->destroy();
+diff --git a/rpcs3/Emu/RSX/VK/vkutils/commands.cpp b/rpcs3/Emu/RSX/VK/vkutils/commands.cpp
+index 549d557af..17ee421f1 100644
+--- a/rpcs3/Emu/RSX/VK/vkutils/commands.cpp
++++ b/rpcs3/Emu/RSX/VK/vkutils/commands.cpp
+@@ -3,6 +3,10 @@
+ #include "shared.h"
+ #include "sync.h"
+ 
++#include "Emu/RSX/VK/VKGSRenderTypes.hpp"
++#include "Emu/System.h"
++#include "util/logs.hpp"
++
+ namespace vk
+ {
+ 	// This queue flushing method to be implemented by the backend as behavior depends on config
+@@ -87,7 +91,30 @@ namespace vk
+ 	{
+ 		if (m_submit_fence && is_pending)
+ 		{
+-			wait_for_fence(m_submit_fence);
++			// ETK Tier 1 (787B reframe / Lead D, gt5p-boss-lsd-iteration 2026-07-01):
++			// this used to call wait_for_fence(m_submit_fence) with the default
++			// timeout=0, which spins forever on vkGetFenceStatus and NEVER routes
++			// through Turnip's msm_device_check_status fault-detection (only the
++			// bounded vkWaitForFences path does, per vk_common_WaitForFences ->
++			// vk_device_check_status). Live-confirmed on-rig 2x (different tracks,
++			// different a6xx fault signatures): rsx::thread busy-spins here
++			// (State: R, wchan=0) for the entire GPU-hang window with nothing
++			// watching, requiring a human R3 SIGKILL. A bounded wait converts an
++			// unrecoverable silent wedge into a detected, logged, clean stop.
++			const VkResult wait_result = wait_for_fence(m_submit_fence, GENERAL_WAIT_TIMEOUT);
++			if (wait_result != VK_SUCCESS) [[unlikely]]
++			{
++				// Do NOT proceed to reset()/reuse this command buffer - its prior
++				// submission's GPU work is in an unknown state (timed out or the
++				// device is lost), so resetting it now would race a still-possibly-
++				// live submission or corrupt state on the next recording pass.
++				rsx_log.fatal("GPU fence wait failed (VkResult=%d) after %uus - GPU is likely hung or lost. Stopping emulation.",
++					static_cast<s32>(wait_result), static_cast<u32>(GENERAL_WAIT_TIMEOUT));
++				vk::mark_device_lost();
++				Emu.Kill(false, false);
++				return;
++			}
++
+ 			is_pending = false;
+ 
+ 			//CHECK_RESULT(vkResetFences(pool->get_owner(), 1, &m_submit_fence));
+diff --git a/rpcs3/Emu/RSX/VK/vkutils/descriptors.h b/rpcs3/Emu/RSX/VK/vkutils/descriptors.h
+index 6794d399e..f18588c69 100644
+--- a/rpcs3/Emu/RSX/VK/vkutils/descriptors.h
++++ b/rpcs3/Emu/RSX/VK/vkutils/descriptors.h
+@@ -116,7 +116,7 @@ namespace vk
+ 		// 1024 costs one extra vkUpdateDescriptorSets per 1024 writes and takes the
+ 		// reservation to ~57KB. The two constants have to move together: the flush
+ 		// threshold is what guarantees the queue never outruns the reservation.
+-#ifdef __ANDROID__
++#if defined(__ANDROID__) || defined(ETK_CONSTRAINED_HOST)
+ 		static constexpr size_t max_cache_size = 1024;
+ #else
+ 		static constexpr size_t max_cache_size = 16384;
+diff --git a/rpcs3/Emu/RSX/VK/vkutils/shared.cpp b/rpcs3/Emu/RSX/VK/vkutils/shared.cpp
+index c4a0219e6..c34d34ad7 100644
+--- a/rpcs3/Emu/RSX/VK/vkutils/shared.cpp
++++ b/rpcs3/Emu/RSX/VK/vkutils/shared.cpp
+@@ -1,6 +1,9 @@
+ #include "device.h"
+ #include "shared.h"
+ #include "util/logs.hpp"
++#include "Emu/System.h"
++
++#include <atomic>
+ 
+ #ifndef _WIN32
+ #include <signal.h>
+@@ -10,6 +13,33 @@ namespace vk
+ {
+ 	extern void print_debug_markers();
+ 
++	// Teardown guard latch: once the device is lost, destructors must not
++	// call back into the driver/layer chain (see shared.h).
++	static std::atomic<bool> g_device_lost_flag{ false };
++
++	void mark_device_lost()
++	{
++		bool expected = false;
++		if (g_device_lost_flag.compare_exchange_strong(expected, true))
++		{
++			// ETK tguard v4 (quit-on-lost): once the device is lost, any
++			// emulation stop must also end the PROCESS — in headless/no-gui
++			// use the Qt shell otherwise idles in exec() after Emu.Kill and
++			// the frontend launcher never regains control. Quit(true)
++			// bypasses the misc.autoexit config; riding after_kill_callback
++			// sequences it strictly after teardown completes.
++			Emu.after_kill_callback = []()
++			{
++				Emu.Quit(true);
++			};
++		}
++	}
++
++	bool is_device_lost()
++	{
++		return g_device_lost_flag.load();
++	}
++
+ 	std::string retrieve_device_fault_info()
+ 	{
+ 		if (!g_render_device || !g_render_device->get_extended_device_fault_support())
+@@ -131,6 +161,7 @@ namespace vk
+ 			break;
+ 		case VK_ERROR_DEVICE_LOST:
+ 			error_message = "Device lost (Driver crashed with unspecified error or stopped responding and recovered) (VK_ERROR_DEVICE_LOST)";
++			mark_device_lost();
+ 			extra_info = retrieve_device_fault_info();
+ 			break;
+ 		case VK_ERROR_MEMORY_MAP_FAILED:
+diff --git a/rpcs3/Emu/RSX/VK/vkutils/shared.h b/rpcs3/Emu/RSX/VK/vkutils/shared.h
+index f8ffcc103..9b75a765b 100644
+--- a/rpcs3/Emu/RSX/VK/vkutils/shared.h
++++ b/rpcs3/Emu/RSX/VK/vkutils/shared.h
+@@ -10,6 +10,13 @@ namespace vk
+ 
+ 	void die_with_error(VkResult error_code, std::string message = {}, std::source_location src_loc = std::source_location::current());
+ 
++	// Sticky device-loss latch (teardown guard). Set the moment any path sees
++	// VK_ERROR_DEVICE_LOST; consulted during teardown so destructors never
++	// call back into a dead device/layer chain (post-loss swapchain destroy
++	// segfaulted 2-for-2: null-PFN exec, and a torn layer-hook deref).
++	void mark_device_lost();
++	bool is_device_lost();
++
+ 	VKAPI_ATTR VkBool32 VKAPI_CALL dbgFunc(VkFlags msgFlags, VkDebugReportObjectTypeEXT objType,
+ 	                                       u64 srcObject, usz location, s32 msgCode,
+ 	                                       const char *pLayerPrefix, const char *pMsg, void *pUserData);
+diff --git a/rpcs3/Emu/RSX/VK/vkutils/swapchain.cpp b/rpcs3/Emu/RSX/VK/vkutils/swapchain.cpp
+index d4d4a1bc6..9ef9ae935 100644
+--- a/rpcs3/Emu/RSX/VK/vkutils/swapchain.cpp
++++ b/rpcs3/Emu/RSX/VK/vkutils/swapchain.cpp
+@@ -1,5 +1,6 @@
+ #include "stdafx.h"
+ #include "swapchain.h"
++#include "shared.h"
+ 
+ namespace vk
+ {
+@@ -146,7 +147,14 @@ namespace vk
+ 	{
+ 		if (VkDevice pdev = dev)
+ 		{
+-			if (m_vk_swapchain)
++			// Teardown guard: after a device loss aborts a swapchain reinit,
++			// this object can hold a swapchain handle with a null or torn
++			// dispatch pointer — calling it segfaulted 2-for-2 on live a6xx
++			// hangcheck recoveries (bare null-PFN exec, and a freed
++			// layer-hook deref with an overlay layer loaded). On a lost
++			// device the kernel reclaims driver objects at process exit;
++			// skipping the destroy call is correct, not a leak.
++			if (m_vk_swapchain && _vkDestroySwapchainKHR && !vk::is_device_lost())
+ 			{
+ 				_vkDestroySwapchainKHR(pdev, m_vk_swapchain, nullptr);
+ 			}
+diff --git a/rpcs3/Emu/RSX/VK/vkutils/sync.cpp b/rpcs3/Emu/RSX/VK/vkutils/sync.cpp
+index 0a04c977a..e59e479fa 100644
+--- a/rpcs3/Emu/RSX/VK/vkutils/sync.cpp
++++ b/rpcs3/Emu/RSX/VK/vkutils/sync.cpp
+@@ -7,11 +7,13 @@
+ #include "shared.h"
+ 
+ #include "Emu/Cell/timers.hpp"
+-#include "Emu/system.h"
++#include "Emu/System.h" // ETK Linux build fix: case-sensitive FS (base had "Emu/system.h")
+ #include "Utilities/Thread.h"
+ #include "Emu/RSX/rsx_profiler.h"
++#include "Emu/RSX/Overlays/overlay_message.h"
+ 
+ #include <chrono>
++#include <cstdlib>
+ #include <thread>
+ 
+ #include "util/sysinfo.hpp"
+@@ -178,6 +180,10 @@ namespace vk
+ 	{
+ 		vkResetFences(owner, 1, &handle);
+ 		flushed.release(false);
++		// ETK: a reset fence starts a fresh life — clear the staleness stamp
++		// or reused fences would inherit age (same rule as t3devlost4).
++		etk_stale_since_us.release(0);
++		etk_stale_warned.release(false);
+ 	}
+ 
+ 	void fence::signal_flushed()
+@@ -595,6 +601,136 @@ namespace vk
+ 		);
+ 	}
+ 
++	// ETK fence force-signal ("drive-through") — see the doc block in sync.h.
++	// The policy lives HERE, inside wait_for_fence, so every wait site in the
++	// backend (the tguard-bounded commands.cpp/VKPresent.cpp waits AND the
++	// legacy timeout=0 waits) inherits it without per-site edits: a forced
++	// fence returns VK_SUCCESS and the caller continues down its normal
++	// completion path. The one non-wait_for_fence poll site (poke() in
++	// VKGSRenderTypes.hpp, the GT HD hard-sync drain) calls the note_*
++	// helpers directly.
++	bool etk_fence_force_enabled()
++	{
++		static const bool enabled = []()
++		{
++			const char* v = std::getenv("GTK_FENCE_FORCE_SIGNAL");
++			return !(v && *v == '0'); // ETK v0.7.0: on by default; "0" = kill-switch
++		}();
++		return enabled;
++	}
++
++	static u64 etk_fence_force_threshold_us()
++	{
++		static const u64 threshold = []() -> u64
++		{
++			if (const char* v = std::getenv("GTK_FENCE_FORCE_SIGNAL_MS"))
++			{
++				if (const u64 ms = std::strtoull(v, nullptr, 10))
++				{
++					return ms * 1000ull;
++				}
++			}
++			// 5 s: far above any legitimate fence latency on this rig
++			// (frame fences signal in ms; shader-compile stalls are CPU-side
++			// and never hold a submitted fence this long), far below the
++			// operator's R3 reflex.
++			return 5'000'000ull;
++		}();
++		return threshold;
++	}
++
++	static u64 etk_steady_now_us()
++	{
++		return std::chrono::duration_cast<std::chrono::microseconds>(
++			std::chrono::steady_clock::now().time_since_epoch()).count();
++	}
++
++	static atomic_t<u64> g_etk_fence_forced_count = 0;
++
++	// ffs-v5 (v0.7.4): expose the forced-fence count so the RSX-side flip
++	// force-retire net can gate on "a rescue actually happened in this
++	// window" (RSXThread.cpp stage 4). Read-only, lock-free.
++	u64 etk_fence_forced_count()
++	{
++		return g_etk_fence_forced_count.load();
++	}
++
++	// Player-facing rescue notice (operator request 2026-07-05): the freeze is
++	// noticeable, so tell the driver to stay at the controls. Queued via
++	// RPCS3's native overlay the moment a stall crosses the warn threshold —
++	// the overlay renders through the present path, so the message physically
++	// appears at the FIRST frame after the rescue (kernel-alone recovery or
++	// force-signal), which is exactly when control returns.
++	static constexpr u64 ETK_STALL_WARN_US = 1'500'000;
++
++	static void etk_queue_rescue_notice(const char* text, u64 expiration_us)
++	{
++		// ETK: coalesce recovery notices — one visible overlay per stall episode.
++		// The warn (etk_fence_note_not_ready) and the resolution (force-signal, or
++		// etk_fence_note_signaled kernel-survive) are two paths for ONE stall;
++		// without this guard they stack as duplicate "GTK Crash Recovery" overlays
++		// (observed on Honeykrisp/Asahi 2026-08-31). Refresh the window, don't restack.
++		static atomic_t<u64> s_notice_until_us = 0;
++		const u64 now = etk_steady_now_us();
++		const u64 until = s_notice_until_us;
++		if (now < until)
++		{
++			return; // a recovery notice is already on screen
++		}
++		s_notice_until_us.release(now + expiration_us);
++		rsx::overlays::queue_message(std::string(text), expiration_us);
++	}
++
++	bool etk_fence_note_not_ready(fence* pfence)
++	{
++		if (!etk_fence_force_enabled())
++		{
++			return false;
++		}
++
++		const u64 now = etk_steady_now_us();
++		const u64 since = pfence->etk_stale_since_us;
++		if (!since)
++		{
++			pfence->etk_stale_since_us.release(now);
++			return false;
++		}
++		if (now - since >= ETK_STALL_WARN_US && !pfence->etk_stale_warned.exchange(true))
++		{
++			etk_queue_rescue_notice("GTK Crash Recovery", 8'000'000);
++		}
++		if (now - since < etk_fence_force_threshold_us())
++		{
++			return false;
++		}
++
++		pfence->etk_stale_since_us.release(0);
++		pfence->etk_stale_warned.release(false);
++		const u64 n = ++g_etk_fence_forced_count;
++		rsx_log.error("ETK fence force-signal #%llu: fence stuck NOT_READY for >%llums (post-hangcheck orphan) - force-completing and continuing (GTK_FENCE_FORCE_SIGNAL).",
++			n, etk_fence_force_threshold_us() / 1000);
++		etk_queue_rescue_notice("GTK Crash Recovery", 5'000'000);
++		return true;
++	}
++
++	void etk_fence_note_signaled(fence* pfence)
++	{
++		const u64 since = pfence->etk_stale_since_us;
++		if (since)
++		{
++			// Kernel-alone survive: the fence came back on its own after a
++			// noticeable stall (the 2026-07-05 21:56 GT5P shape). Same
++			// driver-facing message as the forced path — the player doesn't
++			// care which layer caught it.
++			if (etk_steady_now_us() - since >= ETK_STALL_WARN_US)
++			{
++				etk_queue_rescue_notice("GTK Crash Recovery", 5'000'000);
++			}
++			pfence->etk_stale_since_us.release(0);
++			pfence->etk_stale_warned.release(false);
++		}
++	}
++
+ 	VkResult wait_for_fence(fence* pFence, u64 timeout)
+ 	{
+ 		RSX_PROF_SCOPE(fence_wait);
+@@ -603,7 +739,24 @@ namespace vk
+ 
+ 		if (timeout)
+ 		{
+-			return vkWaitForFences(*g_render_device, 1, &pFence->handle, VK_FALSE, timeout * 1000ull);
++			VkResult result = vkWaitForFences(*g_render_device, 1, &pFence->handle, VK_FALSE, timeout * 1000ull);
++			// ETK drive-through: don't hand VK_TIMEOUT to the caller (whose
++			// policy is Emu.Kill) while the force-signal window is still
++			// aging — keep waiting in bounded slices and force-complete at
++			// the threshold. Flag off => identical to stock (single wait).
++			while (result == VK_TIMEOUT && etk_fence_force_enabled())
++			{
++				if (etk_fence_note_not_ready(pFence))
++				{
++					return VK_SUCCESS; // forced — caller continues normally
++				}
++				result = vkWaitForFences(*g_render_device, 1, &pFence->handle, VK_FALSE, 250'000'000ull); // 250 ms slice
++			}
++			if (result == VK_SUCCESS)
++			{
++				etk_fence_note_signaled(pFence);
++			}
++			return result;
+ 		}
+ 		else
+ 		{
+@@ -631,6 +784,7 @@ namespace vk
+ 
+ 				if (status == VK_SUCCESS)
+ 				{
++					etk_fence_note_signaled(pFence);
+ 					return VK_SUCCESS;
+ 				}
+ 
+@@ -667,18 +821,43 @@ namespace vk
+ 			//
+ 			// A second of granularity is nothing against a wait already long enough to reach the
+ 			// unbounded path, and it costs one extra vkWaitForFences per second of hang.
++			//
++			// ETK drive-through (re-merged onto ARMSX3 1.0.4): the base's slices make this wait
++			// abandonable on stop, but a fence orphaned by a hangcheck rescue still never
++			// signals, so the race is over either way. With GTK_FENCE_FORCE_SIGNAL on (the
++			// default) the slices shrink to 250 ms and the fence ages between them; at the
++			// threshold it is force-completed and the caller drives down its normal completion
++			// path. Flag off (=0) => exactly this base's stock 1 s-slice loop.
++			const bool etk_force = etk_fence_force_enabled();
++			const u64 slice_ns = etk_force ? 250'000'000ull : 1'000'000'000ull;
++			bool warned_slow = false;
++
+ 			for (u64 slice = 0;; slice++)
+ 			{
+-				const VkResult status = vkWaitForFences(*g_render_device, 1, &pFence->handle, VK_FALSE, 1'000'000'000ull);
++				const VkResult status = vkWaitForFences(*g_render_device, 1, &pFence->handle, VK_FALSE, slice_ns);
++
++				if (status == VK_SUCCESS)
++				{
++					etk_fence_note_signaled(pFence);
++					return VK_SUCCESS;
++				}
+ 
+ 				if (status != VK_TIMEOUT)
+ 				{
+ 					return status;
+ 				}
+ 
++				if (etk_force && etk_fence_note_not_ready(pFence))
++				{
++					return VK_SUCCESS; // forced — see sync.h doc block
++				}
++
++				const u64 waited_ms = (slice + 1) * (slice_ns / 1'000'000);
++
+ 				// Say so, once, rather than looking identical to a freeze.
+-				if (slice == 2)
++				if (!warned_slow && waited_ms >= 3000)
+ 				{
++					warned_slow = true;
+ 					rsx_log.error("GPU has not signalled a fence in 3s. If this persists the driver "
+ 						"is not completing submitted work; closing the game is still possible.");
+ 				}
+@@ -686,7 +865,7 @@ namespace vk
+ 				if (thread_ctrl::state() == thread_state::aborting || Emu.IsStopped())
+ 				{
+ 					// Leaving a fence unwaited is not clean, but the alternative is never leaving.
+-					rsx_log.error("Abandoning a GPU fence wait after %us because emulation is stopping.", slice + 1);
++					rsx_log.error("Abandoning a GPU fence wait after %us because emulation is stopping.", waited_ms / 1000);
+ 					return VK_TIMEOUT;
+ 				}
+ 			}
+diff --git a/rpcs3/Emu/RSX/VK/vkutils/sync.h b/rpcs3/Emu/RSX/VK/vkutils/sync.h
+index 9177e8411..3fd0fc122 100644
+--- a/rpcs3/Emu/RSX/VK/vkutils/sync.h
++++ b/rpcs3/Emu/RSX/VK/vkutils/sync.h
+@@ -24,6 +24,16 @@ namespace vk
+ 		VkFence handle         = VK_NULL_HANDLE;
+ 		VkDevice owner         = VK_NULL_HANDLE;
+ 
++		// ETK fence force-signal ("drive-through", 2026-07-05): steady-clock us
++		// of the first NOT_READY observation on THIS fence; 0 = not stale.
++		// Cleared on every observed signal and on reset(), so per-frame fence
++		// reuse cannot age. See etk_fence_note_not_ready() in sync.cpp.
++		atomic_t<u64> etk_stale_since_us = 0;
++		// One-shot per stale episode: the "RESCUING FROM CRASH" player
++		// notification has been queued for this episode. Cleared with the
++		// stamp (signal/reset) so a later episode warns again.
++		atomic_t<bool> etk_stale_warned = false;
++
+ 		fence(VkDevice dev);
+ 		~fence();
+ 		fence(const fence&) = delete;
+@@ -35,6 +45,21 @@ namespace vk
+ 		operator bool() const;
+ 	};
+ 
++	// ETK fence force-signal (GTK stack, 2026-07-05). Under the KGSL-parity
++	// kernel a hangcheck recovery keeps the GPU context alive, but a fence
++	// whose submission depended on the dropped submit will NEVER signal
++	// (proven live: GT HD frozen 20 s+, GPU idle, rsx spinning ~350% CPU).
++	// When armed (GTK_FENCE_FORCE_SIGNAL=1) a fence continuously NOT_READY
++	// past the threshold (GTK_FENCE_FORCE_SIGNAL_MS, default 5000) is
++	// force-completed at the emulator level: log, treat as signaled, present
++	// one garbage frame, keep racing. Default-off => behavior-identical to
++	// the tguard fast-exit build, so the two policies A/B via RPCS3_ENV_FLAGS
++	// without a rebuild.
++	bool etk_fence_force_enabled();
++	bool etk_fence_note_not_ready(fence* pfence);  // true => force-complete NOW
++	void etk_fence_note_signaled(fence* pfence);
++	u64 etk_fence_forced_count();                  // ffs-v5 rescue gate (RSXThread.cpp)
++
+ 	class event
+ 	{
+ 		enum class sync_backend
+diff --git a/rpcs3/Emu/System.cpp b/rpcs3/Emu/System.cpp
+index ff87377ff..ba8c21a7a 100644
+--- a/rpcs3/Emu/System.cpp
++++ b/rpcs3/Emu/System.cpp
+@@ -54,6 +54,7 @@
+ #include "Utilities/JIT.h"
+ 
+ #include "Emu/IPC_socket.h"
++#include "Emu/pitlink/pitlink.h"
+ 
+ #if defined(HAVE_VULKAN)
+ #include "Emu/RSX/VK/VulkanAPI.h"
+@@ -987,6 +988,10 @@ void Emulator::Init()
+ 	{
+ 		g_fxo->init<IPC_socket::IPC_server_manager>(true);
+ 	}
++
++	// ETK GTK Pitlink (GTK_PITLINK=1): a process singleton, so the second Init of a --no-gui
++	// boot -- the one that costs PINE its socket file -- is a no-op here.
++	pitlink::start();
+ }
+ 
+ void Emulator::SetUsr(const std::string& user)
+@@ -3972,8 +3977,28 @@ void Emulator::GracefulShutdown(bool allow_autoexit, bool async_op, bool savesta
+ extern bool check_if_vdec_contexts_exist();
+ extern bool try_lock_spu_threads_in_a_state_compatible_with_savestates(bool revert_lock = false, std::vector<std::pair<shared_ptr<named_thread<spu_thread>>, u32>>* out_list = nullptr);
+ 
++namespace vk { bool is_device_lost(); } // ETK tguard latch (vkutils/shared.cpp)
++
+ void Emulator::Kill(bool allow_autoexit, bool savestate, savestate_stage* save_stage)
+ {
++	// ETK tguard v6 (fast teardown, operator-directed 2026-07-05): on a lost
++	// device there is NOTHING worth tearing down gracefully — every polite
++	// path just walks dead Vulkan state for minutes (measured 90-116+ s
++	// fault-to-exit on the rig) while the driver answers DEVICE_LOST to
++	// every call. All persistent state that matters is already on disk:
++	// the log writer streams continuously (the fatal line is grep-able
++	// while the process is still alive), Mesa's shader disk cache writes
++	// during play, and game saves are transactional on their own schedule.
++	// The kernel reclaims everything else. Exit NOW; runemu returns, the
++	// frontend relaunches, and the session postmortem attributes the crash
++	// from on-disk evidence. Skipping destructors on a dead device is
++	// correct-by-construction (the London-pan precedent, 2026-07-05).
++	if (vk::is_device_lost())
++	{
++		sys_log.error("Device lost: fast teardown — exiting immediately (etk-tguard-v6).");
++		std::_Exit(0);
++	}
++
+ 	static const auto make_ptr = [](auto ptr)
+ 	{
+ 		return std::shared_ptr<std::remove_pointer_t<decltype(ptr)>>(ptr);
+diff --git a/rpcs3/Emu/pitlink/pitlink.cpp b/rpcs3/Emu/pitlink/pitlink.cpp
+new file mode 100644
+index 000000000..147002df0
+--- /dev/null
++++ b/rpcs3/Emu/pitlink/pitlink.cpp
+@@ -0,0 +1,1459 @@
++#include "stdafx.h"
++#include "pitlink.h"
++
++#include "Emu/System.h"
++#include "Emu/Memory/vm.h"
++#include "Emu/Io/pad_types.h"
++#include "Emu/RSX/RSXThread.h"
++#include "rpcs3_version.h"
++
++LOG_CHANNEL(pitlink_log, "PITLINK");
++
++// GTK Pitlink server (PLNK v1, ETK docs/PITLINK_SPEC.md section 3). Linux desktop only: the
++// listening socket lives in the abstract namespace (no path, so nothing can unlink it out
++// from under a second Init -- the way PINE's rpcs3.sock is lost at a --no-gui boot), with an
++// optional TCP listener bound to one address or interface (the USB-net gadget), never ANY.
++#if defined(__linux__) && !defined(__ANDROID__)
++#define PITLINK_SUPPORTED 1
++#include <arpa/inet.h>
++#include <fcntl.h>
++#include <ifaddrs.h>
++#include <net/if.h>
++#include <netinet/in.h>
++#include <netinet/tcp.h>
++#include <poll.h>
++#include <sys/eventfd.h>
++#include <sys/socket.h>
++#include <sys/un.h>
++#include <time.h>
++#include <unistd.h>
++#include <zstd.h>
++#endif
++
++#include <algorithm>
++#include <array>
++#include <atomic>
++#include <cerrno>
++#include <chrono>
++#include <cstddef>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <deque>
++#include <functional>
++#include <memory>
++#include <mutex>
++#include <optional>
++#include <string>
++#include <thread>
++
++namespace rsx
++{
++	void set_native_ui_flip(); // RSXThread.cpp: ask the RSX thread for one native-UI flip
++}
++
++namespace pitlink
++{
++	namespace
++	{
++		constexpr u32 k_magic = 0x4B4E4C50; // "PLNK"
++		constexpr u16 k_proto = 1;
++		constexpr usz k_ports = 7;          // CELL_PAD_MAX_PORT_NUM
++		constexpr usz k_max_msg = 16u << 20;
++		constexpr usz k_max_sched = 64;     // scheduled PADs per port
++
++		enum msg : u16
++		{
++			HELLO = 0x0001, PING = 0x0002,
++			PAD = 0x0010, PAD_RELEASE = 0x0011,
++			VIDEO = 0x0020, SNAP = 0x0021,
++			RAM_READ = 0x0030, RAM_WRITE = 0x0031, WATCH = 0x0032,
++			PAUSE = 0x0040, RESUME = 0x0041, STEP = 0x0042, EXIT = 0x0043,
++			STATUS = 0x0050,
++			HELLO_OK = 0x8001, PONG = 0x8002, ACK = 0x800F, RAM_DATA = 0x8030,
++			STATUS_REPLY = 0x8050, FRAME = 0x8090, EVENT = 0x80A0,
++		};
++
++		enum event_kind : u16
++		{
++			EV_BOOT = 1, EV_STATE = 2, EV_TITLE = 3, EV_DEADMAN = 4, EV_RESCUE = 5, EV_ERROR = 6, EV_STEP = 7,
++		};
++
++		struct config
++		{
++			bool enabled = false;
++			std::string tcp;   // "a.b.c.d:port" or "iface:port"
++			std::string token;
++			u32 video_w = 640, video_h = 360, video_hz = 30;
++			u8 pad_mode = 1;   // 0 off, 1 merge, 2 exclusive
++			u32 ttl_ms = 500;
++		};
++
++		std::string env_str(const char* name)
++		{
++			const char* v = std::getenv(name);
++			return v ? std::string(v) : std::string();
++		}
++
++		// Heap, never destroyed: the detached server thread may still read it while static
++		// destructors run at process exit.
++		const config& conf()
++		{
++			static const config* const c = []()
++			{
++				config* r = new config();
++				r->enabled = env_str("GTK_PITLINK") == "1";
++				r->tcp = env_str("GTK_PITLINK_TCP");
++				r->token = env_str("GTK_PITLINK_TOKEN");
++
++				// "640x360@30"; "0" = no stream (SNAP still works)
++				const std::string video = env_str("GTK_PITLINK_VIDEO");
++				if (video == "0")
++				{
++					r->video_w = r->video_h = r->video_hz = 0;
++				}
++				else if (!video.empty())
++				{
++					unsigned w = 0, h = 0, hz = 0;
++					if (std::sscanf(video.c_str(), "%ux%u@%u", &w, &h, &hz) == 3 && w && h && hz)
++					{
++						r->video_w = w;
++						r->video_h = h;
++						r->video_hz = hz;
++					}
++				}
++
++				const std::string pad = env_str("GTK_PITLINK_PAD");
++				if (pad == "off") r->pad_mode = 0;
++				else if (pad == "exclusive") r->pad_mode = 2;
++
++				if (const std::string ttl = env_str("GTK_PITLINK_TTL_MS"); !ttl.empty())
++				{
++					const long v = std::strtol(ttl.c_str(), nullptr, 10);
++					if (v >= 50 && v <= 60000) r->ttl_ms = static_cast<u32>(v);
++				}
++				return r;
++			}();
++			return *c;
++		}
++
++		u64 now_ns()
++		{
++#ifdef PITLINK_SUPPORTED
++			timespec ts{};
++			clock_gettime(CLOCK_MONOTONIC, &ts);
++			return static_cast<u64>(ts.tv_sec) * 1'000'000'000ull + static_cast<u64>(ts.tv_nsec);
++#else
++			return 0;
++#endif
++		}
++
++		// One agent pad state. Live on a port (pad_now) or scheduled for a flip (pad_sched).
++		struct pad_cmd
++		{
++			bool active = false;
++			u8 mode = 1;
++			u16 buttons = 0;
++			std::array<u8, 12> pressure{};
++			u8 lx = 128, ly = 128, rx = 128, ry = 128;
++			u64 at_flip = 0;
++		};
++
++		bool is_neutral(const pad_cmd& c)
++		{
++			return !c.buttons && c.lx == 128 && c.ly == 128 && c.rx == 128 && c.ry == 128;
++		}
++
++		struct out_frame
++		{
++			frame_ticket meta;
++			std::vector<u8> bgra;
++			u32 width = 0;
++			u32 height = 0;
++		};
++
++		struct state
++		{
++			std::once_flag started;
++
++			// CLOCK (RSX thread writes)
++			std::atomic<u64> flip{0};
++			std::atomic<u64> last_flip_ns{0};
++			std::atomic<u64> vblank{0};      // cached at the flip: the server never touches rsx::thread
++			std::atomic<f32> fps{0.f};
++			std::atomic<u32> step_left{0};
++
++			// EYES config (server writes, RSX reads)
++			std::atomic<u32> clients{0};     // HELLO'd connections
++			std::mutex video_mtx;
++			u32 vw = 0, vh = 0, vhz = 0;
++			u8 codec = 1, zlevel = 1;
++			bool snap_pending = false;
++			u8 snap_codec = 1;
++			u64 last_tap_ns = 0;
++
++			// MEMORY watch list
++			std::mutex watch_mtx;
++			std::vector<std::pair<u32, u8>> watch;
++			usz watch_bytes = 0;
++
++			// HANDS
++			std::mutex pad_mtx;
++			std::array<pad_cmd, k_ports> pad_now{};
++			// PADs stamped for a future flip, ordered by at_flip (a press is two of them:
++			// down at F, up at F+n -- a single slot would let the release overwrite the press).
++			std::array<std::vector<pad_cmd>, k_ports> pad_sched{};
++			// Dead-man per port: refreshed by EVERY PAD received (now or scheduled), so a dead
++			// link releases the live state AND drops whatever was scheduled.
++			std::array<u64, k_ports> pad_deadline{};
++
++			// server outbox: the latest stream frame (latest-wins), frames that are OWED (a SNAP, the
++			// frame a STEP stopped on -- never overwritten by a stream frame), queued events
++			std::mutex out_mtx;
++			std::optional<out_frame> frame;
++			std::deque<out_frame> owed;
++			std::deque<std::pair<u16, std::string>> events;
++			int wake_fd = -1;
++		};
++
++		// Never destroyed: the server thread outlives static destruction at process exit.
++		state& st()
++		{
++			static state* const s = new state();
++			return *s;
++		}
++
++		void wake()
++		{
++#ifdef PITLINK_SUPPORTED
++			const int fd = st().wake_fd;
++			if (fd >= 0)
++			{
++				const u64 one = 1;
++				[[maybe_unused]] const auto r = ::write(fd, &one, sizeof(one));
++			}
++#endif
++		}
++
++		void queue_event(u16 kind, std::string text)
++		{
++			auto& s = st();
++			{
++				std::lock_guard lock(s.out_mtx);
++				if (s.events.size() < 256)
++				{
++					s.events.emplace_back(kind, std::move(text));
++				}
++			}
++			wake();
++		}
++
++		// PAD button bit (PLNK v1) for a cellPad (offset, keycode); -1 = not ours (PS, specials).
++		int button_bit(u32 offset, u32 keycode)
++		{
++			if (offset == CELL_PAD_BTN_OFFSET_DIGITAL1)
++			{
++				for (int i = 0; i < 8; i++)
++				{
++					if (keycode == (1u << i)) return i;
++				}
++			}
++			else if (offset == CELL_PAD_BTN_OFFSET_DIGITAL2)
++			{
++				for (int i = 0; i < 8; i++)
++				{
++					if (keycode == (1u << i)) return 8 + i;
++				}
++			}
++			return -1;
++		}
++
++		// Index into PAD.pressure[] (= cellPad press offset - 8) for a button bit; -1 = none.
++		int pressure_index(int bit)
++		{
++			switch (bit)
++			{
++			case 4: return CELL_PAD_BTN_OFFSET_PRESS_UP - 8;
++			case 5: return CELL_PAD_BTN_OFFSET_PRESS_RIGHT - 8;
++			case 6: return CELL_PAD_BTN_OFFSET_PRESS_DOWN - 8;
++			case 7: return CELL_PAD_BTN_OFFSET_PRESS_LEFT - 8;
++			case 8: return CELL_PAD_BTN_OFFSET_PRESS_L2 - 8;
++			case 9: return CELL_PAD_BTN_OFFSET_PRESS_R2 - 8;
++			case 10: return CELL_PAD_BTN_OFFSET_PRESS_L1 - 8;
++			case 11: return CELL_PAD_BTN_OFFSET_PRESS_R1 - 8;
++			case 12: return CELL_PAD_BTN_OFFSET_PRESS_TRIANGLE - 8;
++			case 13: return CELL_PAD_BTN_OFFSET_PRESS_CIRCLE - 8;
++			case 14: return CELL_PAD_BTN_OFFSET_PRESS_CROSS - 8;
++			case 15: return CELL_PAD_BTN_OFFSET_PRESS_SQUARE - 8;
++			default: return -1;
++			}
++		}
++
++		// RAM_READ / RAM_WRITE (server thread) and WATCH (RSX thread, at the flip): vm::try_access holds a range lock, so a
++		// concurrent unmap cannot pull the page out from under the copy. Writes go to the sudo
++		// mirror too -- they do not invalidate texture-cache copies, which is fine for the game
++		// state Pitlink pokes (see spec 2.4).
++		bool guest_read(u32 addr, u32 size, u8* dst)
++		{
++			return size && vm::try_access(addr, dst, size, false);
++		}
++
++		bool guest_write(u32 addr, u32 size, const u8* src)
++		{
++			// try_access only reads from ptr when is_write is set
++			return size && vm::try_access(addr, const_cast<u8*>(src), size, true);
++		}
++
++		// Clock changes run on the main thread, in arrival order with each other (a STEP's resume
++		// can never land after a later PAUSE), and the server waits -- bounded -- for them to have
++		// happened, so the ACK means "applied", not "queued". Not BlockingCallFromMainThread: that
++		// expects a named_thread caller and waits forever if the call is dropped.
++		bool on_main_thread(std::function<void()> fn, u32 timeout_ms = 2000)
++		{
++			auto done = std::make_shared<std::atomic<bool>>(false);
++			Emu.CallFromMainThread([fn = std::move(fn), done]()
++			{
++				fn();
++				done->store(true);
++			});
++			for (u32 i = 0; i < timeout_ms && !done->load(); i++)
++			{
++				std::this_thread::sleep_for(std::chrono::milliseconds(1));
++			}
++			return done->load();
++		}
++
++		u32 emu_state_code()
++		{
++			switch (Emu.GetStatus())
++			{
++			case system_state::running: return 0;
++			case system_state::paused: return 1;
++			default: return 2;
++			}
++		}
++
++#ifdef PITLINK_SUPPORTED
++		// ---------------------------------------------------------------- wire helpers
++		void put_u8(std::string& b, u8 v) { b.push_back(static_cast<char>(v)); }
++		void put_u16(std::string& b, u16 v) { put_u8(b, v & 0xff); put_u8(b, v >> 8); }
++		void put_u32(std::string& b, u32 v) { put_u16(b, v & 0xffff); put_u16(b, v >> 16); }
++		void put_u64(std::string& b, u64 v) { put_u32(b, v & 0xffffffffu); put_u32(b, static_cast<u32>(v >> 32)); }
++		void put_f32(std::string& b, f32 v) { u32 u; std::memcpy(&u, &v, 4); put_u32(b, u); }
++		void put_str(std::string& b, const std::string& s)
++		{
++			const usz n = std::min<usz>(s.size(), 0xffff);
++			put_u16(b, static_cast<u16>(n));
++			b.append(s.data(), n);
++		}
++
++		struct reader
++		{
++			const u8* p;
++			usz n;
++			usz off = 0;
++			bool ok = true;
++
++			bool need(usz k) { if (off + k > n) ok = false; return ok; }
++			u8 u8_() { if (!need(1)) return 0; return p[off++]; }
++			u16 u16_() { if (!need(2)) return 0; const u16 v = static_cast<u16>(p[off] | (p[off + 1] << 8)); off += 2; return v; }
++			u32 u32_() { const u32 lo = u16_(); const u32 hi = u16_(); return lo | (hi << 16); }
++			u64 u64_() { const u64 lo = u32_(); const u64 hi = u32_(); return lo | (hi << 32); }
++			std::string str() { const u16 k = u16_(); if (!need(k)) return {}; std::string s(reinterpret_cast<const char*>(p + off), k); off += k; return s; }
++			const u8* bytes(usz k) { if (!need(k)) return nullptr; const u8* r = p + off; off += k; return r; }
++		};
++
++		std::string make_msg(u16 type, u32 seq, const std::string& payload)
++		{
++			std::string m;
++			m.reserve(16 + payload.size());
++			put_u32(m, k_magic);
++			put_u16(m, type);
++			put_u16(m, 0);
++			put_u32(m, seq);
++			put_u32(m, static_cast<u32>(payload.size()));
++			m += payload;
++			return m;
++		}
++
++		std::string ack(u16 for_type, s16 status, const std::string& text = {})
++		{
++			std::string p;
++			put_u16(p, for_type);
++			put_u16(p, static_cast<u16>(status));
++			put_str(p, text);
++			return p;
++		}
++
++		// ---------------------------------------------------------------- server
++		struct client
++		{
++			int fd = -1;             // -2: close after flushing what is queued; -3: closed
++			u64 since_ns = 0;        // accept time (a socket that never HELLOs is reaped)
++			bool hello = false;
++			bool controller = false;
++			bool send_last = false;  // owed the most recent frame (a paused car sends no new ones)
++			std::string in;
++			std::string out;
++			usz out_off = 0;
++			usz frame_end = 0;       // out offset where the last queued frame ends (latest-wins gate)
++		};
++
++		void set_nonblock(int fd)
++		{
++			const int fl = ::fcntl(fd, F_GETFL, 0);
++			::fcntl(fd, F_SETFL, fl | O_NONBLOCK);
++		}
++
++		int listen_abstract()
++		{
++			const int fd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
++			if (fd < 0) return -1;
++
++			sockaddr_un sa{};
++			sa.sun_family = AF_UNIX;
++			static constexpr char name[] = "etk-pitlink";
++			sa.sun_path[0] = '\0';
++			std::memcpy(sa.sun_path + 1, name, sizeof(name) - 1);
++			const socklen_t len = static_cast<socklen_t>(offsetof(sockaddr_un, sun_path) + 1 + sizeof(name) - 1);
++
++			if (::bind(fd, reinterpret_cast<sockaddr*>(&sa), len) != 0 || ::listen(fd, 8) != 0)
++			{
++				pitlink_log.error("abstract socket @etk-pitlink: %s", std::string(std::strerror(errno)));
++				::close(fd);
++				return -1;
++			}
++			set_nonblock(fd);
++			return fd;
++		}
++
++		// "a.b.c.d:port" or "iface:port" (the USB-net gadget, whose address differs per car).
++		// Never ANY: a link that steers the car is not offered to every network the rig is on.
++		int listen_tcp(const std::string& spec, bool quiet)
++		{
++			const usz colon = spec.rfind(':');
++			if (colon == std::string::npos) return -1;
++			const std::string host = spec.substr(0, colon);
++			const int port = std::atoi(spec.c_str() + colon + 1);
++			if (port <= 0 || port > 65535) return -1;
++
++			in_addr addr{};
++			if (::inet_pton(AF_INET, host.c_str(), &addr) != 1)
++			{
++				ifaddrs* ifs = nullptr;
++				bool found = false;
++				if (::getifaddrs(&ifs) == 0)
++				{
++					for (ifaddrs* i = ifs; i; i = i->ifa_next)
++					{
++						if (i->ifa_addr && i->ifa_addr->sa_family == AF_INET && i->ifa_name && host == i->ifa_name)
++						{
++							addr = reinterpret_cast<sockaddr_in*>(i->ifa_addr)->sin_addr;
++							found = true;
++							break;
++						}
++					}
++					::freeifaddrs(ifs);
++				}
++				if (!found)
++				{
++					if (!quiet) pitlink_log.warning("TCP: interface '%s' has no IPv4 address yet; will retry", host);
++					return -1;
++				}
++			}
++
++			if (addr.s_addr == htonl(INADDR_ANY))
++			{
++				if (!quiet) pitlink_log.error("TCP: refusing to listen on every interface (%s); name one address or interface", spec);
++				return -1;
++			}
++
++			const int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
++			if (fd < 0) return -1;
++			const int one = 1;
++			::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
++
++			sockaddr_in sa{};
++			sa.sin_family = AF_INET;
++			sa.sin_port = htons(static_cast<u16>(port));
++			sa.sin_addr = addr;
++			if (::bind(fd, reinterpret_cast<sockaddr*>(&sa), sizeof(sa)) != 0 || ::listen(fd, 8) != 0)
++			{
++				if (!quiet) pitlink_log.warning("TCP %s: %s; will retry", spec, std::string(std::strerror(errno)));
++				::close(fd);
++				return -1;
++			}
++			set_nonblock(fd);
++			char txt[INET_ADDRSTRLEN]{};
++			::inet_ntop(AF_INET, &addr, txt, sizeof(txt));
++			pitlink_log.success("listening on %s:%d", std::string(txt), port);
++			return fd;
++		}
++
++		std::string encode_frame(out_frame& f, u8 codec, u8 level)
++		{
++			const usz raw = f.bgra.size();
++			std::string img;
++			if (codec == 1)
++			{
++				img.resize(ZSTD_compressBound(raw));
++				const usz n = ZSTD_compress(img.data(), img.size(), f.bgra.data(), raw, level ? level : 1);
++				if (ZSTD_isError(n))
++				{
++					codec = 0;
++				}
++				else
++				{
++					img.resize(n);
++				}
++			}
++			if (codec != 1)
++			{
++				codec = 0;
++				img.assign(reinterpret_cast<const char*>(f.bgra.data()), raw);
++			}
++
++			std::string p;
++			p.reserve(36 + f.meta.watch.size() + img.size());
++			put_u64(p, f.meta.flip);
++			put_u64(p, f.meta.vblank);
++			put_u64(p, f.meta.host_ns);
++			put_u16(p, static_cast<u16>(f.width));
++			put_u16(p, static_cast<u16>(f.height));
++			put_u8(p, codec);
++			put_u8(p, f.meta.full ? 1 : 0);
++			put_u16(p, static_cast<u16>(f.meta.watch.size()));
++			put_f32(p, f.meta.fps);
++			p.append(reinterpret_cast<const char*>(f.meta.watch.data()), f.meta.watch.size());
++			p += img;
++			return make_msg(FRAME, 0, p);
++		}
++
++		void on_message(client& c, std::vector<client>& all, u16 type, u32 seq, const u8* data, usz len)
++		{
++			auto& s = st();
++			reader r{data, len};
++			const auto reply = [&](u16 t, const std::string& payload) { c.out += make_msg(t, seq, payload); };
++
++			if (!c.hello && type != HELLO)
++			{
++				if (!conf().token.empty())
++				{
++					c.fd = -2; // a token is set: HELLO must come first -- close, no reply
++					return;
++				}
++				if (type != PING && type != STATUS && type != RAM_READ)
++				{
++					reply(ACK, ack(type, -2, "HELLO first"));
++					return;
++				}
++			}
++
++			const bool control = type == PAD || type == PAD_RELEASE || type == VIDEO || type == SNAP ||
++				type == RAM_WRITE || type == WATCH || type == PAUSE || type == RESUME || type == STEP || type == EXIT;
++			if (control && !c.controller)
++			{
++				reply(ACK, ack(type, -1, "observer"));
++				return;
++			}
++
++			switch (type)
++			{
++			case HELLO:
++			{
++				const u16 proto = r.u16_();
++				r.u16_();
++				const std::string token = r.str();
++				if (!conf().token.empty() && token != conf().token)
++				{
++					c.fd = -2; // bad token: close, no reply
++					return;
++				}
++				if (!r.ok || proto != k_proto)
++				{
++					reply(ACK, ack(HELLO, -1, "unsupported protocol"));
++					return;
++				}
++				if (!c.hello)
++				{
++					c.hello = true;
++					c.send_last = true;
++					if (s.clients++ == 0)
++					{
++						// First viewer: arm EYES with the environment's default size and rate.
++						std::lock_guard lock(s.video_mtx);
++						s.vw = conf().video_w;
++						s.vh = conf().video_h;
++						s.vhz = conf().video_hz;
++						s.last_tap_ns = 0;
++					}
++				}
++
++				// The role is decided at every HELLO: the wheel goes to whoever asks while it is
++				// free. No silent promotion -- a reconnecting driver must never find a passive
++				// dashboard holding the wheel it was quietly handed.
++				bool taken = false;
++				for (const auto& o : all)
++				{
++					taken |= (&o != &c && o.fd >= 0 && o.hello && o.controller);
++				}
++				c.controller = !taken;
++
++				std::string p;
++				put_u16(p, k_proto);
++				put_u16(p, 0xF); // video | pad | ram | clock
++				put_u32(p, c.controller ? 0 : 1);
++				put_str(p, rpcs3::get_verbose_version());
++				put_str(p, Emu.GetTitleID());
++				put_str(p, Emu.GetTitle());
++				reply(HELLO_OK, p);
++				pitlink_log.notice("client %d: HELLO role=%s", c.fd, c.controller ? "controller" : "observer");
++				return;
++			}
++			case PING:
++			{
++				std::string p;
++				put_u64(p, s.flip.load());
++				put_u64(p, now_ns());
++				reply(PONG, p);
++				return;
++			}
++			case PAD:
++			{
++				pad_cmd cmd;
++				const u8 port = r.u8_();
++				const u8 mode = r.u8_();
++				cmd.buttons = r.u16_();
++				if (const u8* pr = r.bytes(12)) std::memcpy(cmd.pressure.data(), pr, 12);
++				cmd.lx = r.u8_();
++				cmd.ly = r.u8_();
++				cmd.rx = r.u8_();
++				cmd.ry = r.u8_();
++				const u16 ttl = r.u16_();
++				r.u16_();
++				const u64 at_flip = r.u64_();
++				if (!r.ok || port >= k_ports || (mode > 2 && mode != 255))
++				{
++					reply(ACK, ack(PAD, -4, "bad PAD"));
++					return;
++				}
++				cmd.active = true;
++				cmd.mode = mode == 255 ? conf().pad_mode : mode;
++				const u32 ttl_ms = ttl ? ttl : conf().ttl_ms;
++
++				std::lock_guard lock(s.pad_mtx);
++				if (at_flip && at_flip > s.flip.load())
++				{
++					auto& q = s.pad_sched[port];
++					if (q.size() >= k_max_sched)
++					{
++						reply(ACK, ack(PAD, -7, "schedule full"));
++						return;
++					}
++					cmd.at_flip = at_flip;
++					// Ordered by at_flip; equal stamps keep arrival order (upper_bound).
++					const auto pos = std::upper_bound(q.begin(), q.end(), at_flip,
++						[](u64 f, const pad_cmd& e) { return f < e.at_flip; });
++					q.insert(pos, cmd);
++				}
++				else
++				{
++					// "Now" replaces the live state; it never cancels what is scheduled.
++					s.pad_now[port] = cmd;
++				}
++				s.pad_deadline[port] = now_ns() + u64{ttl_ms} * 1'000'000ull;
++				return;
++			}
++			case PAD_RELEASE:
++			{
++				const u8 port = r.u8_();
++				if (port < k_ports)
++				{
++					std::lock_guard lock(s.pad_mtx);
++					s.pad_now[port] = pad_cmd{};
++					s.pad_sched[port].clear();
++					s.pad_deadline[port] = 0;
++				}
++				return;
++			}
++			case VIDEO:
++			{
++				const u16 w = r.u16_(), h = r.u16_(), hz = r.u16_();
++				const u8 codec = r.u8_(), level = r.u8_();
++				r.u8_(); // overlays: v1 taps the game image only (pre-overlay)
++				if (!r.ok || codec > 1)
++				{
++					reply(ACK, ack(VIDEO, -4, "bad VIDEO"));
++					return;
++				}
++				{
++					std::lock_guard lock(s.video_mtx);
++					s.vw = w; // 0 = native
++					s.vh = h;
++					s.vhz = std::min<u16>(hz, 120);
++					s.codec = codec;
++					s.zlevel = level ? std::min<u8>(level, 19) : 1;
++					s.last_tap_ns = 0;
++				}
++				reply(ACK, ack(VIDEO, 0));
++				return;
++			}
++			case SNAP:
++			{
++				const u8 codec = r.u8_();
++				if (!r.ok || codec > 1)
++				{
++					reply(ACK, ack(SNAP, -4, "bad SNAP"));
++					return;
++				}
++				{
++					std::lock_guard lock(s.video_mtx);
++					s.snap_pending = true;
++					s.snap_codec = codec;
++				}
++				if (emu_state_code() == 1)
++				{
++					// Paused: no game flip is coming, so ask the RSX thread for a native-UI flip
++					// to serve the SNAP on (read back synchronously, see want_frame).
++					rsx::set_native_ui_flip();
++				}
++				reply(ACK, ack(SNAP, 0));
++				return;
++			}
++			case RAM_READ:
++			{
++				const u32 n = r.u32_();
++				if (!r.ok || n > 4096)
++				{
++					reply(ACK, ack(RAM_READ, -1, "bad RAM_READ"));
++					return;
++				}
++				std::string p;
++				put_u32(p, n);
++				std::vector<u8> tmp;
++				for (u32 i = 0; i < n; i++)
++				{
++					const u32 addr = r.u32_();
++					const u32 size = r.u32_();
++					if (!r.ok || p.size() > (8u << 20))
++					{
++						reply(ACK, ack(RAM_READ, -4, "bad RAM_READ item"));
++						return;
++					}
++					const bool fits = size <= 65536;
++					tmp.resize(fits ? size : 0);
++					const bool ok = fits && guest_read(addr, size, tmp.data());
++					put_u8(p, ok ? 1 : 0);
++					put_u32(p, ok ? size : 0);
++					if (ok) p.append(reinterpret_cast<const char*>(tmp.data()), size);
++				}
++				reply(RAM_DATA, p);
++				return;
++			}
++			case RAM_WRITE:
++			{
++				const u32 addr = r.u32_();
++				const u32 size = r.u32_();
++				const u8* bytes = r.bytes(size);
++				const bool ok = r.ok && bytes && size <= 65536 && guest_write(addr, size, bytes);
++				reply(ACK, ack(RAM_WRITE, ok ? 0 : -5, ok ? "" : "unwritable"));
++				return;
++			}
++			case WATCH:
++			{
++				const u32 n = r.u32_();
++				if (!r.ok || n > 256)
++				{
++					reply(ACK, ack(WATCH, -1, "bad WATCH"));
++					return;
++				}
++				std::vector<std::pair<u32, u8>> list;
++				usz total = 0;
++				for (u32 i = 0; i < n; i++)
++				{
++					const u32 addr = r.u32_();
++					const u8 size = r.u8_();
++					r.bytes(3);
++					if (size != 1 && size != 2 && size != 4 && size != 8)
++					{
++						r.ok = false;
++					}
++					list.emplace_back(addr, size);
++					total += size;
++				}
++				if (!r.ok)
++				{
++					reply(ACK, ack(WATCH, -1, "bad WATCH item"));
++					return;
++				}
++				{
++					std::lock_guard lock(s.watch_mtx);
++					s.watch = std::move(list);
++					s.watch_bytes = total;
++				}
++				reply(ACK, ack(WATCH, 0));
++				return;
++			}
++			case PAUSE:
++			{
++				const bool ok = on_main_thread([]()
++				{
++					auto& ss = st();
++					ss.step_left = 0;
++					ss.last_flip_ns = 0; // the fps EMA must not average across the pause
++					Emu.Pause(false, false);
++				});
++				reply(ACK, ack(PAUSE, ok ? 0 : -8, ok ? "" : "main thread busy"));
++				return;
++			}
++			case RESUME:
++			{
++				const bool ok = on_main_thread([]()
++				{
++					st().step_left = 0;
++					Emu.Resume();
++				});
++				reply(ACK, ack(RESUME, ok ? 0 : -8, ok ? "" : "main thread busy"));
++				return;
++			}
++			case STEP:
++			{
++				const u32 flips = r.u32_();
++				if (!r.ok || !flips)
++				{
++					reply(ACK, ack(STEP, -1, "bad STEP"));
++					return;
++				}
++				const bool ok = on_main_thread([flips]()
++				{
++					st().step_left = flips;
++					if (Emu.IsPaused())
++					{
++						Emu.Resume();
++					}
++				});
++				reply(ACK, ack(STEP, ok ? 0 : -8, ok ? "" : "main thread busy"));
++				return;
++			}
++			case EXIT:
++			{
++				const bool savestate = r.u8_() != 0;
++				Emu.CallFromMainThread([savestate]() { Emu.GracefulShutdown(true, false, savestate); });
++				reply(ACK, ack(EXIT, 0));
++				return;
++			}
++			case STATUS:
++			{
++				std::string p;
++				put_u32(p, emu_state_code());
++				put_u64(p, s.flip.load());
++				put_u64(p, s.vblank.load());
++				put_str(p, Emu.GetTitleID());
++				put_str(p, Emu.GetTitle());
++				reply(STATUS_REPLY, p);
++				return;
++			}
++			default:
++				reply(ACK, ack(type, -1, "unknown type"));
++				return;
++			}
++		}
++
++		[[noreturn]] void server_main()
++		{
++			auto& s = st();
++			const int lfd_unix = listen_abstract();
++			int lfd_tcp = -1;
++			u64 tcp_retry_ns = 0;
++			bool tcp_warned = false;
++
++			if (lfd_unix >= 0)
++			{
++				pitlink_log.success("listening on @etk-pitlink");
++			}
++
++			std::vector<client> clients;
++			std::string last_frame_msg;
++			u32 last_state = ~0u;
++			std::string last_title;
++			u64 title_poll_ns = 0;
++
++			while (true)
++			{
++				const u64 now = now_ns();
++
++				// TCP: the gadget may come up after RPCS3 (USB plugged in mid-session) -- retry.
++				if (lfd_tcp < 0 && !conf().tcp.empty() && now >= tcp_retry_ns)
++				{
++					lfd_tcp = listen_tcp(conf().tcp, tcp_warned);
++					tcp_warned = true;
++					tcp_retry_ns = now + 5'000'000'000ull;
++				}
++
++				// Emulator state / title changes become pushed EVENTs.
++				if (!clients.empty())
++				{
++					const u32 code = emu_state_code();
++					if (code != last_state)
++					{
++						last_state = code;
++						queue_event(EV_STATE, code == 0 ? "running" : code == 1 ? "paused" : "stopped");
++					}
++					if (now >= title_poll_ns)
++					{
++						title_poll_ns = now + 1'000'000'000ull;
++						if (std::string title = Emu.GetTitleID(); title != last_title)
++						{
++							last_title = std::move(title);
++							last_frame_msg.clear(); // a new boot owes nobody the old game's picture
++							queue_event(EV_TITLE, last_title);
++						}
++					}
++				}
++
++				// A SNAP is pending while paused (e.g. PAUSE then SNAP in quick succession): no game
++				// flip will come, and a silent pause runs no native-UI refresh -- ask for one.
++				if (!clients.empty() && emu_state_code() == 1)
++				{
++					bool snap;
++					{
++						std::lock_guard lock(s.video_mtx);
++						snap = s.snap_pending;
++					}
++					if (snap)
++					{
++						rsx::set_native_ui_flip();
++					}
++				}
++
++				std::vector<pollfd> pfds;
++				pfds.push_back({s.wake_fd, POLLIN, 0});
++				if (lfd_unix >= 0) pfds.push_back({lfd_unix, POLLIN, 0});
++				if (lfd_tcp >= 0) pfds.push_back({lfd_tcp, POLLIN, 0});
++				const usz first_client = pfds.size();
++				for (const auto& c : clients)
++				{
++					pfds.push_back({c.fd, static_cast<short>(POLLIN | (c.out_off < c.out.size() ? POLLOUT : 0)), 0});
++				}
++
++				if (::poll(pfds.data(), pfds.size(), 100) < 0 && errno != EINTR)
++				{
++					pitlink_log.error("poll: %s", std::string(std::strerror(errno)));
++					std::this_thread::sleep_for(std::chrono::milliseconds(100));
++					continue;
++				}
++
++				// Outbox: the newest frame (encoded once) and any events, to every HELLO'd client.
++				if (pfds[0].revents & POLLIN)
++				{
++					u64 drain = 0;
++					[[maybe_unused]] const auto rr = ::read(s.wake_fd, &drain, sizeof(drain));
++				}
++				{
++					std::optional<out_frame> frame;
++					std::deque<out_frame> owed;
++					std::deque<std::pair<u16, std::string>> events;
++					{
++						std::lock_guard lock(s.out_mtx);
++						frame.swap(s.frame);
++						owed.swap(s.owed);
++						events.swap(s.events);
++					}
++
++					// Oldest first. A SNAP or the frame a STEP stopped on is owed to everyone; a
++					// stream frame is latest-wins per client (a viewer still draining the previous
++					// one skips it rather than queueing a backlog).
++					if (frame)
++					{
++						owed.push_back(std::move(*frame)); // a stream frame: full/sync stay false
++					}
++					std::stable_sort(owed.begin(), owed.end(), [](const out_frame& a, const out_frame& b) { return a.meta.flip < b.meta.flip; });
++
++					for (auto& f : owed)
++					{
++						u8 codec, level;
++						{
++							std::lock_guard lock(s.video_mtx);
++							codec = f.meta.full ? s.snap_codec : s.codec;
++							level = s.zlevel;
++						}
++						const bool must = f.meta.full || f.meta.sync;
++						const std::string msg = encode_frame(f, codec, level);
++						last_frame_msg = msg;
++						for (auto& c : clients)
++						{
++							if (c.hello && (must || c.out_off >= c.frame_end))
++							{
++								c.out += msg;
++								c.frame_end = c.out.size();
++							}
++						}
++					}
++
++					for (const auto& [kind, text] : events)
++					{
++						std::string p;
++						put_u16(p, kind);
++						put_str(p, text);
++						const std::string msg = make_msg(EVENT, 0, p);
++						for (auto& c : clients)
++						{
++							if (c.hello) c.out += msg;
++						}
++					}
++				}
++
++				// Accept
++				for (usz i = 1; i < first_client; i++)
++				{
++					if (!(pfds[i].revents & POLLIN)) continue;
++					const int fd = ::accept4(pfds[i].fd, nullptr, nullptr, SOCK_CLOEXEC | SOCK_NONBLOCK);
++					if (fd < 0) continue;
++					if (clients.size() >= 4)
++					{
++						::close(fd);
++						continue;
++					}
++					if (pfds[i].fd == lfd_tcp)
++					{
++						// NODELAY: a PAD is 48 bytes and must not wait for Nagle. KEEPALIVE: a USB
++						// cable pulled mid-session must not leave a half-open controller.
++						const int one = 1;
++						::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
++						::setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
++					}
++					client nc{fd};
++					nc.since_ns = now;
++					clients.push_back(std::move(nc));
++					pitlink_log.notice("client %d connected", fd);
++				}
++
++				// Read + dispatch, then write
++				for (usz i = 0; i < clients.size() && first_client + i < pfds.size(); i++)
++				{
++					client& c = clients[i];
++					const short rev = pfds[first_client + i].revents;
++
++					// A viewer that stopped reading must not grow without bound (owed frames bypass
++					// the latest-wins gate); a socket that never HELLOs must not hold a seat forever.
++					if (c.fd >= 0 && c.out.size() - c.out_off > (64u << 20))
++					{
++						pitlink_log.warning("client %d: not reading (%u MB queued); dropping it", c.fd, static_cast<u32>((c.out.size() - c.out_off) >> 20));
++						c.fd = -2;
++					}
++					if (c.fd >= 0 && !c.hello && now - c.since_ns > 10'000'000'000ull)
++					{
++						c.fd = -2;
++					}
++
++					if (c.fd >= 0 && (rev & (POLLIN | POLLHUP | POLLERR)))
++					{
++						// Read everything, dispatch everything, THEN honour a hang-up: a client that
++						// sends a PAD and closes (the CLI does) must still have the PAD applied.
++						bool hangup = false;
++						char buf[65536];
++						while (true)
++						{
++							const ssize_t n = ::recv(c.fd, buf, sizeof(buf), 0);
++							if (n > 0)
++							{
++								c.in.append(buf, static_cast<usz>(n));
++								if (c.in.size() > k_max_msg + 16) { hangup = true; break; }
++								continue;
++							}
++							if (n == 0 || (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) hangup = true;
++							break;
++						}
++
++						usz off = 0;
++						while (c.fd >= 0 && c.in.size() - off >= 16)
++						{
++							reader h{reinterpret_cast<const u8*>(c.in.data() + off), 16};
++							const u32 magic = h.u32_();
++							const u16 type = h.u16_();
++							h.u16_();
++							const u32 seq = h.u32_();
++							const u32 len = h.u32_();
++							if (magic != k_magic || len > k_max_msg) { c.fd = -2; break; }
++							if (c.in.size() - off < 16 + usz{len}) break;
++							on_message(c, clients, type, seq, reinterpret_cast<const u8*>(c.in.data() + off + 16), len);
++							off += 16 + usz{len};
++						}
++						if (c.fd >= 0) c.in.erase(0, off);
++						if (hangup && c.fd >= 0) c.fd = -2;
++					}
++
++					if (c.fd == -2)
++					{
++						// Refusal or hang-up: flush what is queued (best effort), then close.
++						const int fd = pfds[first_client + i].fd;
++						if (c.out_off < c.out.size())
++						{
++							[[maybe_unused]] const auto sent = ::send(fd, c.out.data() + c.out_off, c.out.size() - c.out_off, MSG_NOSIGNAL);
++						}
++						::close(fd);
++						c.fd = -3;
++						continue;
++					}
++
++					if (c.fd >= 0 && c.send_last)
++					{
++						c.send_last = false;
++						if (!last_frame_msg.empty() && c.out_off >= c.frame_end)
++						{
++							c.out += last_frame_msg;
++							c.frame_end = c.out.size();
++						}
++						// ...and the current state and title, which it missed if they changed
++						// before its HELLO (re-sent to everyone: harmless).
++						last_state = ~0u;
++						last_title.clear();
++						title_poll_ns = 0;
++					}
++
++					if (c.fd >= 0 && c.out_off < c.out.size())
++					{
++						const ssize_t n = ::send(c.fd, c.out.data() + c.out_off, c.out.size() - c.out_off, MSG_NOSIGNAL);
++						if (n > 0)
++						{
++							c.out_off += static_cast<usz>(n);
++							if (c.out_off == c.out.size())
++							{
++								c.out.clear();
++								c.out_off = 0;
++								c.frame_end = 0;
++							}
++							else if (c.out_off > (1u << 20))
++							{
++								c.out.erase(0, c.out_off);
++								c.frame_end = c.frame_end > c.out_off ? c.frame_end - c.out_off : 0;
++								c.out_off = 0;
++							}
++						}
++						else if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
++						{
++							::close(c.fd);
++							c.fd = -3;
++						}
++					}
++				}
++
++				// Reap closed clients. A controller leaving releases nothing by itself: the pad
++				// dead-man (fed by every PAD) does that within its TTL and says so (EVENT 4), the
++				// same way it covers a link that dies without a FIN. The last viewer stops EYES.
++				for (usz i = 0; i < clients.size();)
++				{
++					if (clients[i].fd >= 0) { i++; continue; }
++					pitlink_log.notice("client disconnected%s", clients[i].controller ? " (controller)" : "");
++					if (clients[i].hello && s.clients.load() > 0) s.clients--;
++					clients.erase(clients.begin() + static_cast<std::ptrdiff_t>(i));
++				}
++			}
++		}
++#endif // PITLINK_SUPPORTED
++	}
++
++	bool enabled()
++	{
++		return conf().enabled;
++	}
++
++	void start()
++	{
++		if (!enabled())
++		{
++			return;
++		}
++
++		std::call_once(st().started, []()
++		{
++#ifdef PITLINK_SUPPORTED
++			st().wake_fd = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
++			std::thread(server_main).detach();
++			pitlink_log.success("GTK Pitlink up (video %ux%u@%u, pad %s, ttl %u ms%s%s)",
++				conf().video_w, conf().video_h, conf().video_hz,
++				conf().pad_mode == 0 ? "off" : conf().pad_mode == 2 ? "exclusive" : "merge", conf().ttl_ms,
++				conf().tcp.empty() ? "" : ", tcp ", conf().tcp);
++#else
++			pitlink_log.warning("GTK_PITLINK is set, but Pitlink is Linux-desktop only in this build");
++#endif
++		});
++	}
++
++	void apply_pad(std::shared_ptr<Pad>* pads, usz count)
++	{
++		if (!enabled())
++		{
++			return;
++		}
++
++		auto& s = st();
++		const u64 now = now_ns();
++		const u64 flip = s.flip.load();
++		std::lock_guard lock(s.pad_mtx);
++
++		for (usz port = 0; port < count && port < k_ports; port++)
++		{
++			auto& q = s.pad_sched[port];
++			pad_cmd& cmd = s.pad_now[port];
++			u64& deadline = s.pad_deadline[port];
++
++			// Dead-man: no PAD for TTL -> neutral, schedule dropped. Reported only when that
++			// actually released something (an idle neutral state lapsing is not news).
++			if (deadline && now > deadline)
++			{
++				const bool released = (cmd.active && !is_neutral(cmd)) || !q.empty();
++				cmd = pad_cmd{};
++				q.clear();
++				deadline = 0;
++				if (released)
++				{
++					queue_event(EV_DEADMAN, fmt::format("port %u released: no PAD within its TTL", static_cast<u32>(port)));
++				}
++				continue;
++			}
++
++			// Promote every scheduled state that has come due; the newest due one is live. The
++			// pad thread ticks ~1 kHz against ~30-60 Hz flips, so states stamped for different
++			// flips are each live for their own flips.
++			usz due = 0;
++			while (due < q.size() && q[due].at_flip <= flip)
++			{
++				due++;
++			}
++			if (due)
++			{
++				cmd = q[due - 1];
++				cmd.at_flip = 0;
++				q.erase(q.begin(), q.begin() + static_cast<std::ptrdiff_t>(due));
++			}
++
++			if (!cmd.active)
++			{
++				continue;
++			}
++
++			const auto& pad = pads[port];
++			if (cmd.mode == 0 || !pad || !pad->is_connected())
++			{
++				continue;
++			}
++
++			const bool exclusive = cmd.mode == 2;
++
++			for (ButtonExternal& b : pad->m_buttons_external)
++			{
++				const int bit = button_bit(b.m_offset, b.m_outKeyCode);
++				if (bit < 0)
++				{
++					continue;
++				}
++
++				const bool on = (cmd.buttons >> bit) & 1;
++				const int pi = pressure_index(bit);
++				const u16 value = on ? static_cast<u16>((pi >= 0 && cmd.pressure[pi]) ? cmd.pressure[pi] : 255) : 0;
++
++				if (exclusive)
++				{
++					b.m_pressed = on;
++					b.m_value = value;
++				}
++				else if (on)
++				{
++					// MERGE: the human's pad stays live; the agent adds presses on top.
++					b.m_pressed = true;
++					b.m_value = std::max(b.m_value, value);
++				}
++			}
++
++			for (AnalogStickExternal& stick : pad->m_sticks_external)
++			{
++				u8 v;
++				switch (stick.m_offset)
++				{
++				case CELL_PAD_BTN_OFFSET_ANALOG_LEFT_X: v = cmd.lx; break;
++				case CELL_PAD_BTN_OFFSET_ANALOG_LEFT_Y: v = cmd.ly; break;
++				case CELL_PAD_BTN_OFFSET_ANALOG_RIGHT_X: v = cmd.rx; break;
++				case CELL_PAD_BTN_OFFSET_ANALOG_RIGHT_Y: v = cmd.ry; break;
++				default: continue;
++				}
++
++				// MERGE: an agent axis only wins while it is off centre, so the human can always
++				// take the wheel back by letting the agent's axis rest.
++				if (exclusive || v != 128)
++				{
++					stick.m_value = v;
++				}
++			}
++		}
++	}
++
++	void on_flip()
++	{
++		if (!enabled())
++		{
++			return;
++		}
++
++		auto& s = st();
++		const u64 now = now_ns();
++		const u64 prev = s.last_flip_ns.exchange(now);
++		s.flip++;
++
++		if (const auto* renderer = rsx::get_current_renderer())
++		{
++			s.vblank.store(renderer->vblank_count.load());
++		}
++
++		if (prev && now > prev)
++		{
++			const f32 inst = 1e9f / static_cast<f32>(now - prev);
++			const f32 old = s.fps.load();
++			s.fps.store(old > 0.f ? old * 0.9f + inst * 0.1f : inst);
++		}
++
++		u32 left = s.step_left.load();
++		while (left && !s.step_left.compare_exchange_weak(left, left - 1))
++		{
++		}
++
++		if (left == 1)
++		{
++			// Directly, on the RSX thread -- as upstream's own pause-after-N-flips does -- so the
++			// pause lands on this flip instead of 1-2 flips later via the main thread.
++			if (Emu.Pause(false, false))
++			{
++				s.last_flip_ns = 0; // the fps EMA must not average across the pause
++				queue_event(EV_STEP, fmt::format("flip=%u", s.flip.load()));
++			}
++		}
++	}
++
++	frame_ticket want_frame(bool emu_flip)
++	{
++		frame_ticket t;
++		if (!enabled())
++		{
++			return t;
++		}
++
++		auto& s = st();
++		if (!s.clients.load())
++		{
++			return t; // nobody watching: EYES cost nothing
++		}
++
++		const u64 now = now_ns();
++
++		// want_frame runs inside the renderer's flip, before rsx::thread::flip ticks on_flip(),
++		// so step_left == 1 on a game flip means this is the frame the STEP stops on.
++		const bool step_final = emu_flip && s.step_left.load() == 1;
++
++		{
++			std::lock_guard lock(s.video_mtx);
++			if (s.snap_pending)
++			{
++				s.snap_pending = false;
++				t.full = true;
++				if (emu_flip)
++				{
++					s.last_tap_ns = now;
++				}
++			}
++			else if (!emu_flip || !s.vhz)
++			{
++				return t; // native-UI flips only serve a SNAP; vhz 0 = no stream
++			}
++			else if (step_final)
++			{
++				s.last_tap_ns = now;
++			}
++			else
++			{
++				// Rate limit with an eighth of a period of slack, so a 30 Hz tap on a 30 fps
++				// game takes every frame instead of aliasing down to 15.
++				const u64 period = 1'000'000'000ull / s.vhz;
++				if (s.last_tap_ns && now - s.last_tap_ns < period - period / 8)
++				{
++					return t;
++				}
++				s.last_tap_ns = now;
++			}
++			t.width = s.vw;
++			t.height = s.vh;
++		}
++
++		// Read back synchronously when nothing would harvest it otherwise: the frame a STEP
++		// stops on (a paused RSX thread never reaches frame_context_cleanup), or a SNAP served
++		// on a native-UI flip / while paused.
++		t.sync = step_final || (t.full && (!emu_flip || Emu.IsPaused()));
++		t.valid = true;
++		t.flip = s.flip.load() + (emu_flip ? 1 : 0);
++		t.host_ns = now;
++		t.fps = s.fps.load();
++		t.vblank = s.vblank.load();
++
++		// WATCH: sampled here, at the flip, so the frame carries the guest state it was drawn from.
++		std::lock_guard lock(s.watch_mtx);
++		t.watch.assign(s.watch_bytes, 0);
++		usz off = 0;
++		for (const auto& [addr, size] : s.watch)
++		{
++			guest_read(addr, size, t.watch.data() + off); // unreadable -> stays zero
++			off += size;
++		}
++		return t;
++	}
++
++	void requeue(frame_ticket&& ticket)
++	{
++		if (!enabled() || !ticket.full)
++		{
++			return; // a stream frame that found no slot is simply skipped
++		}
++
++		auto& s = st();
++		std::lock_guard lock(s.video_mtx);
++		s.snap_pending = true;
++	}
++
++	void submit_frame(frame_ticket&& ticket, const u8* pixels, u32 width, u32 height, bool is_bgra)
++	{
++		if (!enabled() || !pixels || !width || !height)
++		{
++			return;
++		}
++
++		out_frame f;
++		f.meta = std::move(ticket);
++		f.width = width;
++		f.height = height;
++		f.bgra.assign(pixels, pixels + usz{width} * height * 4);
++
++		if (!is_bgra)
++		{
++			for (usz i = 0; i + 3 < f.bgra.size(); i += 4)
++			{
++				std::swap(f.bgra[i], f.bgra[i + 2]);
++			}
++		}
++
++		auto& s = st();
++		{
++			std::lock_guard lock(s.out_mtx);
++			if (f.meta.full || f.meta.sync)
++			{
++				if (s.owed.size() >= 4)
++				{
++					s.owed.pop_front();
++				}
++				s.owed.push_back(std::move(f));
++			}
++			else
++			{
++				s.frame = std::move(f);
++			}
++		}
++		wake();
++	}
++}
+diff --git a/rpcs3/Emu/pitlink/pitlink.h b/rpcs3/Emu/pitlink/pitlink.h
+new file mode 100644
+index 000000000..515c2a80e
+--- /dev/null
++++ b/rpcs3/Emu/pitlink/pitlink.h
+@@ -0,0 +1,67 @@
++#pragma once
++
++// GTK Pitlink -- the Engineer's live link into the car (ETK GTK Edition 0.10.0).
++//
++// One server thread inside RPCS3 that gives an external agent the four things it needs to
++// see and drive a game unattended, each at the boundary where the PS3 itself would see it:
++//   EYES    a downscaled copy of every game flip, read back without a GPU stall
++//   HANDS   pad state written at the cellPad boundary (digital bits AND pressure)
++//   MEMORY  guest RAM reads/writes, plus a WATCH list sampled at the flip
++//   CLOCK   pause, step N flips, graceful exit
++// Wire protocol, flags and rationale: ETK docs/PITLINK_SPEC.md (PLNK v1). Everything is
++// gated on GTK_PITLINK=1; with it unset every hook below is a single relaxed load.
++
++#include "util/types.hpp"
++
++#include <memory>
++#include <vector>
++
++struct Pad;
++
++namespace pitlink
++{
++	// GTK_PITLINK=1 in the environment (read once).
++	bool enabled();
++
++	// Idempotent: start the server thread. Emulator::Init runs more than once in a --no-gui
++	// boot, which is how PINE lost its socket; this is a process singleton by construction.
++	void start();
++
++	// HANDS. Called at the end of pad_thread::apply_copilots(), inside its pad::g_pad_mutex
++	// section, on the game-facing copy (m_buttons_external / m_sticks_external) that
++	// cellPadGetData reads -- one lock section, so the game never sees the human-only pad
++	// between the copy and the overlay.
++	void apply_pad(std::shared_ptr<Pad>* pads, usz count);
++
++	// CLOCK. Called by rsx::thread::flip for GAME flips only (info.emu_flip): the flip
++	// counter, the fps EMA and the STEP budget all run off it. Native-UI flips (overlay
++	// refresh, pause screens, the PPU-compile screen) never tick it.
++	void on_flip();
++
++	// EYES. The renderer asks at each flip whether this frame should be tapped; a valid
++	// ticket carries the frame's identity and the WATCH bytes sampled at that flip, and comes
++	// back with the pixels once the frame's own GPU work has retired.
++	struct frame_ticket
++	{
++		bool valid = false;
++		bool full = false;   // native-size SNAP rather than the configured tap size
++		bool sync = false;   // read back now: the frame a STEP stops on, or a SNAP while paused
++		u32 width = 0;       // requested tap size; 0 = native (clamped to the displayed region)
++		u32 height = 0;
++		u64 flip = 0;        // the flip counter's value once this frame's own flip completes
++		u64 vblank = 0;
++		u64 host_ns = 0;     // CLOCK_MONOTONIC at the flip
++		f32 fps = 0.f;
++		std::vector<u8> watch;
++	};
++
++	// emu_flip = rsx::display_flip_info_t::emu_flip. Non-game flips only ever serve a pending
++	// SNAP (that is how a SNAP is answered while the game is paused).
++	frame_ticket want_frame(bool emu_flip);
++
++	// The renderer had no free ring slot for a valid ticket: a SNAP is re-armed, never lost.
++	void requeue(frame_ticket&& ticket);
++
++	// Pixels are tightly packed 8-bit 4-channel; is_bgra=false swizzles from RGBA.
++	void submit_frame(frame_ticket&& ticket, const u8* pixels, u32 width, u32 height, bool is_bgra);
++}
+diff --git a/rpcs3/Emu/savestate_utils.cpp b/rpcs3/Emu/savestate_utils.cpp
+index e93f2f964..7c17c7461 100644
+--- a/rpcs3/Emu/savestate_utils.cpp
++++ b/rpcs3/Emu/savestate_utils.cpp
+@@ -47,8 +47,8 @@ SERIALIZATION_VER(lv2_sync, 3,                                  1)
+ SERIALIZATION_VER(lv2_vm, 4,                                    1)
+ SERIALIZATION_VER(lv2_net, 5,                                   1, 2/*TCP Feign conection loss*/, 3/*P2PS stream_disconnected status*/)
+ SERIALIZATION_VER(lv2_fs, 6,                                    1, 2/*NPDRM key saving*/)
+-SERIALIZATION_VER(lv2_prx_overlay, 7,                           1)
+-SERIALIZATION_VER(lv2_memory, 8,                                3)
++SERIALIZATION_VER(lv2_prx_overlay, 7,                           2) // ETK: libsysutil hle_data (sysutil startup mapping)
++SERIALIZATION_VER(lv2_memory, 8,                                4) // ETK: system SHM fields back; ARMSX3 wrote 3 in two formats (1.0, 1.0.4)
+ SERIALIZATION_VER(lv2_config, 9,                                1)
+ 
+ namespace rsx
+diff --git a/rpcs3/Emu/system_config.h b/rpcs3/Emu/system_config.h
+index dced848b3..813393a08 100644
+--- a/rpcs3/Emu/system_config.h
++++ b/rpcs3/Emu/system_config.h
+@@ -187,7 +187,13 @@ struct cfg_root : cfg::node
+ 		cfg::_bool disable_msl_fast_math{ this, "Disable MSL Fast Math", false };
+ 		cfg::_bool disable_async_host_memory_manager{ this, "Disable Asynchronous Memory Manager", false, true };
+ 		cfg::_enum<output_scaling_mode> output_scaling{ this, "Output Scaling Mode", output_scaling_mode::bilinear, true };
+-#ifdef __ANDROID__
++		// ETK 0.9.0.1: this block and shader_preset_path below were #ifdef
++		// __ANDROID__, but desktop TUs reference the members UNGATED
++		// (vkutils/swapchain.cpp x4; upscalers/librashader_pass.h via
++		// VKPresent.cpp) -- the desktop build did not compile. Declared
++		// unconditionally instead: the defaults (off / empty) keep desktop
++		// behaviour identical, and the FrameGen backend itself stays
++		// Android-only (see Emu/CMakeLists.txt + VKFrameGen.cpp's stubs).
+ 		// ARMSX3: Lossless Scaling frame generation.
+ 		//
+ 		// Default off and it stays off unless the user supplies shaders from their own copy of
+@@ -218,13 +224,10 @@ struct cfg_root : cfg::node
+ 		// are THS's property -- so the interpolation shaders are read out of a legitimately
+ 		// purchased copy. Kept here so the shader cache can be rebuilt without asking again.
+ 		cfg::string frame_generation_dll_path{ this, "Frame Generation Lossless Path", "", true };
+-#endif
+-#ifdef __ANDROID__
+ 		// ARMSX3: absolute path to a RetroArch .slangp preset, used when
+ 		// Output Scaling Mode is "Shader chain (librashader)". Empty = no chain,
+ 		// which falls back to a plain blit rather than failing to present.
+ 		cfg::string shader_preset_path{ this, "Shader Preset Path", "", true };
+-#endif
+ 		cfg::_bool record_with_overlays{ this, "Record With Overlays", true, true };
+ 		cfg::_bool disable_hardware_blending{ this, "Disable Hardware Blending", false, true };
+ 		// The other direction. "Disable Hardware Blending" forces the shader path on; this forces
+diff --git a/rpcs3/Input/pad_thread.cpp b/rpcs3/Input/pad_thread.cpp
+index 4006ebab8..2cde1eded 100644
+--- a/rpcs3/Input/pad_thread.cpp
++++ b/rpcs3/Input/pad_thread.cpp
+@@ -23,6 +23,7 @@
+ #endif
+ #include "Emu/Io/Null/NullPadHandler.h"
+ #include "Emu/Io/interception.h"
++#include "Emu/pitlink/pitlink.h"
+ #include "Emu/Io/PadHandler.h"
+ #include "Emu/Io/pad_config.h"
+ #include "Emu/System.h"
+@@ -396,6 +397,11 @@ void pad_thread::apply_copilots()
+ 			stick.m_value = static_cast<u16>(std::round(std::clamp(accumulated_value * 127.0f + 128.0f, 0.0f, 255.0f)));
+ 		}
+ 	}
++
++	// ETK GTK Pitlink HANDS: the agent's pad state goes onto the game-facing copy just built
++	// above, inside the same g_pad_mutex section -- so cellPadGetData sees exactly what a
++	// DualShock 3 would report (digital bits AND pressure), never the human-only pad in between.
++	pitlink::apply_pad(m_pads.data(), m_pads.size());
+ }
+ 
+ void pad_thread::update_pad_states()
+diff --git a/rpcs3/rpcs3.cpp b/rpcs3/rpcs3.cpp
+index 2653a73b4..eae6496fe 100644
+--- a/rpcs3/rpcs3.cpp
++++ b/rpcs3/rpcs3.cpp
+@@ -92,6 +92,13 @@ static semaphore<> s_qt_init;
+ atomic_t<bool> g_headless = false;
+ static atomic_t<bool> s_no_gui = false;
+ static atomic_t<char*> s_argv0 = nullptr;
++
++// Device-lost latch (vkutils/shared.cpp). Forward-declared to keep the
++// Vulkan headers out of the main TU; linked from the same binary.
++namespace vk
++{
++	bool is_device_lost();
++}
+ static bool s_is_error_launch = false;
+ 
+ std::string g_input_config_override;
+@@ -372,8 +379,29 @@ public:
+ 					rsx::overlays::queue_message(overlay_msg, umax);
+ 				}
+ 
+-				// Pause emulation if fatal error encountered
+-				Emu.Pause(true);
++				// After a GPU device loss, Pause would freeze the session
++				// forever (nothing can resume on a dead device) and preempt
++				// the clean stop — observed live 2026-07-04 (Path B): a
++				// worker thread's DEVICE_LOST fatal landed here before the
++				// bounded-wait Kill path could run, leaving the game frozen
++				// on-screen with 83 live threads. The vk device-lost latch is
++				// set at first sight of the loss (before any fatal can fire),
++				// so route to a clean Kill instead; the guarded swapchain
++				// teardown handles the rest. Fire-once so a fatal storm
++				// during the Kill teardown cannot re-enter.
++				if (vk::is_device_lost())
++				{
++					static atomic_t<bool> s_devlost_kill_once = false;
++					if (!s_devlost_kill_once.exchange(true))
++					{
++						Emu.Kill(false, false);
++					}
++				}
++				else
++				{
++					// Pause emulation if fatal error encountered
++					Emu.Pause(true);
++				}
+ 			}
+ 		}
+ 	}
+diff --git a/rpcs3/rpcs3_version.cpp b/rpcs3/rpcs3_version.cpp
+index d33c786f7..1fe944118 100644
+--- a/rpcs3/rpcs3_version.cpp
++++ b/rpcs3/rpcs3_version.cpp
+@@ -50,6 +50,24 @@ namespace rpcs3
+ 	std::string get_verbose_version()
+ 	{
+ 		std::string version = fmt::format("%s | %s", rpcs3::get_version().to_string(), get_branch());
++		// ETK build self-identification (verify-markers.sh: "GTK Edition").
++		// The only self-consistent identity of a build — branch names and the
++		// git stamp both went stale once (PROVENANCE-0.8.x.md); bump this
++		// literal at every core revision. 0.9.1 = base bump onto ARMSX3
++		// Release 1.0.4 (ARMSX2/ARMSX3@8290349e5, 692 commits over the
++		// 0.9.0.x base a74a0f3e0): 0.9.0.3's feature set carried verbatim,
++		// plus the tguard bridge for the base's own device-lost path
++		// (RSXThread.cpp) and a Linux include-case fix (vkutils/sync.cpp).
++		// 0.9.1.1 = 0.9.1 + the cellAudio whole-block drop counter, exported
++		// as drop= on the rpcs3_audio_stat line (cellAudio.cpp).
++		// 0.9.1.2 = 0.9.1.1 + tear down the 32-bit graphics-pipe byteswap pass
++		// with the device (VKResolveHelper.cpp): the exit abort + core dump.
++		// 0.10.0 = 0.9.1.2 + GTK Pitlink (Emu/pitlink/): the Engineer's link
++		// into the car -- frame tap at the flip, pad state at the cellPad
++		// boundary, frame-aligned guest RAM, pause/step/exit (GTK_PITLINK,
++		// default off) -- and the PINE socket unlink-race fix. Numbered to
++		// match the GTK 0.10.0 release it ships in.
++		fmt::append(version, " | GTK Edition v0.10.0-hunt-rr7-fix-noflip (armsx3-8290349e5)");
+ 		if (is_local_build())
+ 		{
+ 			fmt::append(version, " | local_build");
+diff --git a/rpcs3/rpcs3qt/kernel_explorer.cpp b/rpcs3/rpcs3qt/kernel_explorer.cpp
+index 926949fb5..954a3fec4 100644
+--- a/rpcs3/rpcs3qt/kernel_explorer.cpp
++++ b/rpcs3/rpcs3qt/kernel_explorer.cpp
+@@ -350,14 +350,15 @@ void kernel_explorer::update()
+ 		{
+ 			auto& mem = static_cast<lv2_memory&>(obj);
+ 			const f64 size_mb = mem.size * 1. / (1024 * 1024);
++			const std::string container = mem.ct ? fmt::format("%s", mem.ct->id) : "System";
+ 
+ 			if (mem.pshared)
+ 			{
+-				add_leaf(node, QString::fromStdString(fmt::format("Shared Mem 0x%08x: Size: 0x%x (%0.2f MB), Chunk: %s, Mappings: %u, Mem Container: %s, Key: %#llx", id, mem.size, size_mb, mem.align == 0x10000u ? "64K" : "1MB", +mem.counter, mem.ct->id, mem.key)));
++				add_leaf(node, QString::fromStdString(fmt::format("Shared Mem 0x%08x: Size: 0x%x (%0.2f MB), Chunk: %s, Mappings: %u, Mem Container: %s, Key: %#llx", id, mem.size, size_mb, mem.align == 0x10000u ? "64K" : "1MB", +mem.counter, container, mem.key)));
+ 				break;
+ 			}
+ 
+-			add_leaf(node, QString::fromStdString(fmt::format("Shared Mem 0x%08x: Size: 0x%x (%0.2f MB), Chunk: %s, Mem Container: %s, Mappings: %u", id, mem.size, size_mb, mem.align == 0x10000u ? "64K" : "1MB", mem.ct->id, +mem.counter)));
++			add_leaf(node, QString::fromStdString(fmt::format("Shared Mem 0x%08x: Size: 0x%x (%0.2f MB), Chunk: %s, Mem Container: %s, Mappings: %u", id, mem.size, size_mb, mem.align == 0x10000u ? "64K" : "1MB", container, +mem.counter)));
+ 			break;
+ 		}
+ 		case SYS_MUTEX_OBJECT:
