@@ -55,3 +55,20 @@ periods arrive through another branch). Control: `GTK_AUDIO_CONCEAL=0` in `RPCS3
 relaunch, same lap — stock sound on the same binary. Expected to carry up the series: GT5P /
 GT6 ship the same silence at a worse deficit, with real skips and underruns on top that this
 does not address.
+
+## Validation addendum (car12, 2026-10-27 afternoon)
+
+- Mint OK (sha `7f551fcc…`), deployed via install.sh, pinned to NPEA90002 by Pitstop. Log line at launch:
+  `GTK_AUDIO_CONCEAL: on (run cap 8 blocks, 2 ch)`. On track `conc` = `sil` (100 % of unwritten periods
+  concealed); past the cap and after true silence the fall-through to stock silence was observed.
+- **Meter** (RPCS3 `Dump to file` WAVs, racing seconds 60–80 at 42–52 fps): silent 5.33 ms blocks
+  OFF 10–19 % → ON 0 %; waveform discontinuities per second OFF ~104 → ON ~48. Operator's ear:
+  "slightly reduced, not dramatically", still tracking the frametime graph. The residual is the resume
+  junction (one phase jump per concealed run). Next: a one-period-latency crossfade into the resumed
+  block, or drain-and-stretch.
+- **Not a crash cause.** The ~100–200 s GPU CP faults seen all afternoon hit conceal ON and OFF alike, the
+  0.10.1 EXP core too, and are car12's baseline under GT loads (GT5P ledger: 3–10 rescued faults per
+  session). What is HD Concept-specific is that its faults rarely rescue (FIFO empty after the GPU
+  reset) — a crash-net item, not an audio one. Dossier: `etk-dossiers/Audio_Crunch_HDConcept_20261027.md`.
+- Default stays ON. Kill-switch `GTK_AUDIO_CONCEAL=0` verified on the same binary (log says
+  `off (stock silence)`, `conc=0`).
