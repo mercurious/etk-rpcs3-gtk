@@ -52,6 +52,8 @@ MARKERS=(
     "etk-pitlink|0.10.0|Pitlink abstract socket name (@etk-pitlink)"
     "pitlink_record_tap|0.10.0|async frame tap at the flip -- no hard sync"
     "m_socket_ino|0.10.0|PINE socket unlink-race fix (inode guard)"
+    "GTK_AUDIO_CONCEAL|0.10.2|cellAudio untouched-period concealment (the sub-native-fps crunch)"
+    "conc=%llu|0.10.2|concealed-period counter -> rpcs3_audio_stat"
 )
 
 # Markers that must ALSO survive into the shipped binary (literal strings in the

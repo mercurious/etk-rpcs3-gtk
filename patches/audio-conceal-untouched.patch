@@ -1,0 +1,323 @@
+diff --git a/rpcs3/Emu/Cell/Modules/cellAudio.cpp b/rpcs3/Emu/Cell/Modules/cellAudio.cpp
+index 2f93dfc..038075c 100644
+--- a/rpcs3/Emu/Cell/Modules/cellAudio.cpp
++++ b/rpcs3/Emu/Cell/Modules/cellAudio.cpp
+@@ -7,10 +7,13 @@
+ #include "Emu/Cell/lv2/sys_process.h"
+ #include "Emu/Cell/lv2/sys_event.h"
+ #include "cellAudio.h"
++#include "etk_audio_conceal.h"
+ #include "util/video_provider.h"
+ 
+ #include <cmath>
+ #include <cstdio>
++#include <cstdlib>
++#include <cstring>
+ #include <ctime>
+ 
+ LOG_CHANNEL(cellAudio);
+@@ -31,6 +34,7 @@ struct etk_audio_stats_t
+ 	u64 skipped_periods = 0;          // cellAudio advanced past untouched buffers (game fell behind)
+ 	u64 silence_periods = 0;          // fully-untouched periods enqueued as silence
+ 	u64 dropped_blocks = 0;           // whole blocks commit_data could not fit into the ring (cellAudio thread)
++	u64 concealed_periods = 0;        // GTK_AUDIO_CONCEAL: untouched periods shipped as concealment, not silence (subset of silence_periods)
+ 	f32 ratio_min = 1.0f;             // lowest time-stretch frequency ratio since start
+ 	u64 start_us = 0;                 // emu clock at reset
+ };
+@@ -41,7 +45,7 @@ static void etk_audio_stats_dump(u64 timestamp_us, f32 cur_ratio, u64 enqueued_p
+ #ifdef __linux__
+ 	char line[256];
+ 	const int n = std::snprintf(line, sizeof(line),
+-		"up_s=%.1f ur=%llu urb=%llu skip=%llu sil=%llu ratio=%.3f rmin=%.3f enq_ms=%.1f buf_ms=%u drop=%llu\n",
++		"up_s=%.1f ur=%llu urb=%llu skip=%llu sil=%llu ratio=%.3f rmin=%.3f enq_ms=%.1f buf_ms=%u drop=%llu conc=%llu\n",
+ 		(timestamp_us - s_etk_aud.start_us) / 1'000'000.0,
+ 		static_cast<unsigned long long>(s_etk_aud.underrun_events.load()),
+ 		static_cast<unsigned long long>(s_etk_aud.underrun_bytes.load()),
+@@ -49,7 +53,8 @@ static void etk_audio_stats_dump(u64 timestamp_us, f32 cur_ratio, u64 enqueued_p
+ 		static_cast<unsigned long long>(s_etk_aud.silence_periods),
+ 		cur_ratio, s_etk_aud.ratio_min,
+ 		enqueued_playtime_us / 1000.0, buf_ms,
+-		static_cast<unsigned long long>(s_etk_aud.dropped_blocks));
++		static_cast<unsigned long long>(s_etk_aud.dropped_blocks),
++		static_cast<unsigned long long>(s_etk_aud.concealed_periods));
+ 	if (n <= 0) return;
+ 
+ 	// Snapshot: latest values, atomically swapped (ETK ledger reads this at post-mortem)
+@@ -243,6 +248,22 @@ audio_ringbuffer::audio_ringbuffer(cell_audio_config& _cfg)
+ 	}();
+ 
+ 	cb_ringbuf.set_buf_size(static_cast<u32>(cfg.backend_ch_cnt * cfg.audio_sampling_rate * cfg.audio_sample_size * buffer_dur_mult));
++
++	// ETK GTK_AUDIO_CONCEAL (0.10.2): on by default, run cap 8 blocks (42.7 ms); GTK_AUDIO_CONCEAL=0
++	// restores stock silence exactly; GTK_AUDIO_CONCEAL_MAX=N (1..64) sets the cap. Read once per
++	// ringbuffer, i.e. per guest audio (re)configuration, like every other GTK_* runtime switch.
++	m_conceal_src = std::make_unique<float[]>(u32{AUDIO_MAX_CHANNELS_COUNT} * u32{AUDIO_BUFFER_SAMPLES});
++	m_conceal_max = 8;
++	if (const char* e = std::getenv("GTK_AUDIO_CONCEAL"); e && e[0] == '0' && e[1] == '\0')
++	{
++		m_conceal_max = 0;
++	}
++	else if (const char* m = std::getenv("GTK_AUDIO_CONCEAL_MAX"))
++	{
++		const long v = std::strtol(m, nullptr, 10);
++		if (v >= 1 && v <= 64) m_conceal_max = static_cast<u32>(v);
++	}
++	cellAudio.notice("GTK_AUDIO_CONCEAL: %s (run cap %u blocks, %u ch)", m_conceal_max ? "on" : "off (stock silence)", m_conceal_max, cfg.audio_channels);
+ 	backend->SetWriteCallback(std::bind(&audio_ringbuffer::backend_write_callback, this, std::placeholders::_1, std::placeholders::_2));
+ 	backend->SetStateCallback(std::bind(&audio_ringbuffer::backend_state_callback, this, std::placeholders::_1));
+ }
+@@ -344,6 +365,29 @@ void audio_ringbuffer::enqueue(bool enqueue_silence, bool force)
+ 	{
+ 		buf = buffer[cur_pos].get();
+ 		cur_pos = (cur_pos + 1) % cfg.num_allocated_buffers;
++
++		if (m_conceal_max)
++		{
++			// ETK GTK_AUDIO_CONCEAL: a real block. If a concealed run precedes it, ramp its first
++			// frames onto the last sample shipped (the step is the one junction concealment cannot
++			// make continuous). Then keep a copy as the next run's source -- taken here, before
++			// commit_data() downmixes/converts the mixer buffer in place.
++			if (m_conceal_run > 0)
++			{
++				etk_audio_conceal::ramp_resume(buf, m_conceal_tail, AUDIO_BUFFER_SAMPLES, cfg.audio_channels);
++			}
++			m_conceal_run = 0;
++			std::memcpy(m_conceal_src.get(), buf, buf_sz * sizeof(float));
++			m_conceal_have_src = true;
++			std::memcpy(m_conceal_tail, buf + (AUDIO_BUFFER_SAMPLES - 1) * cfg.audio_channels, cfg.audio_channels * sizeof(float));
++		}
++	}
++	else if (m_conceal_max)
++	{
++		// ETK GTK_AUDIO_CONCEAL: true silence (startup fill, no active ports, past the run cap).
++		// Saturate the run so the source is never replayed across it, and the tail is zero.
++		m_conceal_run = m_conceal_max;
++		std::memset(m_conceal_tail, 0, sizeof(m_conceal_tail));
+ 	}
+ 
+ 	if (!backend_active.observe() && !force)
+@@ -364,6 +408,40 @@ void audio_ringbuffer::enqueue(bool enqueue_silence, bool force)
+ 	}
+ }
+ 
++void audio_ringbuffer::enqueue_untouched(bool force)
++{
++	// ETK GTK_AUDIO_CONCEAL: the game wrote nothing for this period.
++	if (!m_conceal_max || !m_conceal_have_src || m_conceal_run >= m_conceal_max)
++	{
++		enqueue(true, force);
++		return;
++	}
++
++	static float conceal_buffer[u32{AUDIO_MAX_CHANNELS_COUNT} * u32{AUDIO_BUFFER_SAMPLES}]{};
++
++	etk_audio_conceal::fill(conceal_buffer, m_conceal_src.get(), AUDIO_BUFFER_SAMPLES, cfg.audio_channels, m_conceal_run, m_conceal_max);
++	std::memcpy(m_conceal_tail, conceal_buffer + (AUDIO_BUFFER_SAMPLES - 1) * cfg.audio_channels, cfg.audio_channels * sizeof(float));
++	m_conceal_run++;
++	m_concealed_blocks++;
++	s_etk_aud.concealed_periods++;
++
++	if (!backend_active.observe() && !force)
++	{
++		// backend is not ready yet
++		return;
++	}
++
++	// Same path as a real block (commit_data downmixes conceal_buffer in place; it is scratch).
++	if (cfg.time_stretching_enabled)
++	{
++		resampler.put_samples(conceal_buffer, AUDIO_BUFFER_SAMPLES);
++	}
++	else
++	{
++		commit_data(conceal_buffer, AUDIO_BUFFER_SAMPLES);
++	}
++}
++
+ void audio_ringbuffer::enqueue_silence(u32 buf_count, bool force)
+ {
+ 	for (u32 i = 0; i < buf_count; i++)
+@@ -923,6 +1001,7 @@ void cell_audio_thread::operator()()
+ 	s_etk_aud.skipped_periods = 0;
+ 	s_etk_aud.silence_periods = 0;
+ 	s_etk_aud.dropped_blocks = 0;
++	s_etk_aud.concealed_periods = 0;
+ 	s_etk_aud.ratio_min = 1.0f;
+ 	s_etk_aud.start_us = get_system_time();
+ 	u64 etk_last_dump_us = 0;
+@@ -1210,8 +1289,8 @@ void cell_audio_thread::operator()()
+ 			{
+ 				// There's no audio in the buffers, simply advance time
+ 				cellAudio.trace("enqueuing silence: untouched=%u/%u (expected=%u), enqueued_buffers=%llu", untouched, active_ports, untouched_expected, enqueued_buffers);
+-				s_etk_aud.silence_periods++; // ETK aud1: a fully-silent period shipped to the backend
+-				ringbuffer->enqueue_silence();
++				s_etk_aud.silence_periods++; // ETK aud1: a period the game never wrote, shipped in its place (sil=; conc= says how many were concealed)
++				ringbuffer->enqueue_untouched(); // ETK GTK_AUDIO_CONCEAL: conceal from the last real block, or stock silence
+ 				note_untouched(untouched, active_ports);
+ 				advance(timestamp);
+ 				continue;
+diff --git a/rpcs3/Emu/Cell/Modules/cellAudio.h b/rpcs3/Emu/Cell/Modules/cellAudio.h
+index 904083c..f8a0079 100644
+--- a/rpcs3/Emu/Cell/Modules/cellAudio.h
++++ b/rpcs3/Emu/Cell/Modules/cellAudio.h
+@@ -332,6 +332,18 @@ private:
+ 
+ 	u32 cur_pos = 0;
+ 
++	// ETK GTK_AUDIO_CONCEAL (0.10.2): untouched-period concealment state (cellAudio thread only).
++	// m_conceal_src = the last block the game wrote, copied BEFORE commit_data downmixes in place;
++	// m_conceal_tail = the last sample shipped per channel (real, concealed or silence);
++	// m_conceal_run = concealed blocks shipped since the last real one (saturated at
++	// m_conceal_max after true silence, so a stale source is never replayed);
++	// m_conceal_max = the run cap in blocks, 0 = feature off (stock silence).
++	std::unique_ptr<float[]> m_conceal_src{};
++	float m_conceal_tail[AUDIO_MAX_CHANNELS_COUNT]{};
++	u32 m_conceal_run = 0;
++	u32 m_conceal_max = 0;
++	bool m_conceal_have_src = false;
++
+ 	bool get_backend_playing() const
+ 	{
+ 		return backend->IsPlaying();
+@@ -350,6 +362,10 @@ public:
+ 	u64 update(bool emu_is_paused);
+ 	void enqueue(bool enqueue_silence = false, bool force = false);
+ 	void enqueue_silence(u32 buf_count = 1, bool force = false);
++	// ETK GTK_AUDIO_CONCEAL: a period the game never wrote -- concealed from the last real
++	// block while the run cap allows, stock silence otherwise (and always when the switch is off).
++	void enqueue_untouched(bool force = false);
++	bool conceal_enabled() const { return m_conceal_max > 0; }
+ 	void process_resampled_data();
+ 	f32 set_frequency_ratio(f32 new_ratio);
+ 
+@@ -364,6 +380,9 @@ public:
+ 	// whole, which is audible; counted so it stops being invisible.
+ 	atomic_t<u32> m_dropped_blocks{0};
+ 
++	// ETK GTK_AUDIO_CONCEAL: untouched periods shipped as concealment instead of silence.
++	atomic_t<u32> m_concealed_blocks{0};
++
+ 	bool is_playing() const
+ 	{
+ 		return playing;
+diff --git a/rpcs3/Emu/Cell/Modules/etk_audio_conceal.h b/rpcs3/Emu/Cell/Modules/etk_audio_conceal.h
+new file mode 100644
+index 0000000..ea62cd4
+--- /dev/null
++++ b/rpcs3/Emu/Cell/Modules/etk_audio_conceal.h
+@@ -0,0 +1,97 @@
++#pragma once
++
++// =========================================================================
++// ETK GTK Edition -- cellAudio untouched-period concealment (GTK_AUDIO_CONCEAL)
++//
++// A game that fills its audio once per rendered frame leaves a 5.33 ms period
++// unwritten for every frame it misses below its native rate. Stock cellAudio
++// ships each one as silence: a hard gate, tens of times a second on a slow
++// title (GT HD Concept on the SM8250, car12 2026-10-27: sil ~40/s at ~50 fps
++// on a 60 fps game, zero underruns, zero drops) -- a buzz riding the engine
++// note that the operator hears as "crunch". The silence also keeps the ring
++// full, so time stretching never engages.
++//
++// This header is the arithmetic only, with no RPCS3 dependencies, so a host
++// test can pin it (etk-rpcs3-gtk: hwtest/test_audio_conceal.cpp). The
++// ringbuffer owns the state and decides when to call it (cellAudio.cpp).
++//
++// Concealment: the unwritten period is filled from the last block the game
++// DID write, ping-pong -- reversed on the first concealed block (so its first
++// sample equals the last sample already shipped), forward on the next, and so
++// on: every junction inside a run is sample-continuous and the block keeps the
++// spectrum of the signal it stands in for. A run is capped (run_max blocks):
++// the last block of a run fades linearly to silence and everything past the
++// cap is silence, so a game that has genuinely stopped writing (loading, a
++// stall) goes quiet instead of buzzing a frozen block forever. When real audio
++// resumes after a run, ramp_resume() removes the step between the last sample
++// shipped and the first real one with a short linear offset ramp (no dip, no
++// gain change). GTK_AUDIO_CONCEAL=0 restores stock silence exactly.
++// =========================================================================
++
++#include <algorithm>
++#include <cstdint>
++#include <cstring>
++
++namespace etk_audio_conceal
++{
++	// Length of the offset ramp applied to the first real block after a run (frames; 1.33 ms at 48 kHz)
++	constexpr uint32_t RESUME_RAMP_FRAMES = 64;
++
++	// Fill one block (frames x channels, interleaved) standing in for a period the game never wrote.
++	// src is the last real block (same geometry). run = concealed blocks already shipped in this run
++	// (0 = first). Returns true when the block carries signal, false when it is silence (run >= run_max).
++	inline bool fill(float* dst, const float* src, uint32_t frames, uint32_t channels, uint32_t run, uint32_t run_max)
++	{
++		const uint32_t n = frames * channels;
++
++		if (run >= run_max || frames == 0 || channels == 0)
++		{
++			std::memset(dst, 0, n * sizeof(float));
++			return false;
++		}
++
++		const bool reversed = (run % 2) == 0;
++
++		for (uint32_t f = 0; f < frames; f++)
++		{
++			const uint32_t sf = reversed ? (frames - 1 - f) : f;
++			std::memcpy(dst + f * channels, src + sf * channels, channels * sizeof(float));
++		}
++
++		if (run + 1 == run_max)
++		{
++			// Last block the cap allows: fade to silence so the hand-over to the zeros that
++			// follow is not itself a step.
++			for (uint32_t f = 0; f < frames; f++)
++			{
++				const float g = 1.0f - static_cast<float>(f + 1) / static_cast<float>(frames);
++				float* row = dst + f * channels;
++				for (uint32_t c = 0; c < channels; c++) row[c] *= g;
++			}
++		}
++
++		return true;
++	}
++
++	// Real audio resumes after a concealed run: prev_tail[c] is the last sample shipped on channel c.
++	// Adds a linear offset ramp so buf's first frame lands (almost) on prev_tail and the correction
++	// has died out RESUME_RAMP_FRAMES later. In place, no gain change, no dip.
++	inline void ramp_resume(float* buf, const float* prev_tail, uint32_t frames, uint32_t channels)
++	{
++		const uint32_t len = std::min(frames, RESUME_RAMP_FRAMES);
++
++		if (len == 0) return;
++
++		for (uint32_t c = 0; c < channels; c++)
++		{
++			const float delta = prev_tail[c] - buf[c];
++
++			if (delta == 0.0f) continue;
++
++			for (uint32_t f = 0; f < len; f++)
++			{
++				buf[f * channels + c] += delta * (1.0f - static_cast<float>(f + 1) / static_cast<float>(len));
++			}
++		}
++	}
++}
+diff --git a/rpcs3/rpcs3_version.cpp b/rpcs3/rpcs3_version.cpp
+index f693b4e..06ac6c4 100644
+--- a/rpcs3/rpcs3_version.cpp
++++ b/rpcs3/rpcs3_version.cpp
+@@ -70,7 +70,12 @@ namespace rpcs3
+ 		// 0.10.1 = 0.10.0 + upstream RPCS3 #19760 (kd-11, 2026-10-08) backported:
+ 		// framebuffer aliasing tie-break for same-tag color/depth overlaps --
+ 		// GT6's rear-view mirror sampled stale depth memory (black, minimap bleed).
+-		fmt::append(version, " | GTK Edition v0.10.1 (armsx3-8290349e5)");
++		// 0.10.2 = 0.10.1 + GTK_AUDIO_CONCEAL (cellAudio.cpp, etk_audio_conceal.h): a
++		// period the game never wrote is concealed from the last block it did write
++		// (ping-pong, capped run, fade-out, resume ramp) instead of shipped as
++		// silence -- the sub-native-fps "crunch" (GT HD Concept, car12 2026-10-27:
++		// sil ~40/s tracking the frame deficit, ur=0, drop=0). conc= on the stat line.
++		fmt::append(version, " | GTK Edition v0.10.2 (armsx3-8290349e5)");
+ 		if (is_local_build())
+ 		{
+ 			fmt::append(version, " | local_build");
