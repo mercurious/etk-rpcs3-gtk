@@ -32,6 +32,11 @@ fi
 # Required markers: string, and the release that introduced it. Anything listed
 # here must appear in EVERY later cumulative patch — these are the features the
 # fork exists to ship. Add a line whenever a new gated feature lands.
+# An optional 4th field names the ONE base lineage a marker belongs to (armsx3 or
+# rpcs3): a fix for code only that base has. The patch's lineage is read from its
+# own "GTK Edition v<ver> (<lineage>-<sha>)" literal, so it can never be waived by
+# a flag. 0.11.0 moved back to upstream RPCS3, where ARMSX3's 32-bit byteswap pass
+# (and so its teardown) does not exist.
 MARKERS=(
     "GTK_REMAP0_ONE|0.6.0|#11912 road-flicker fix (force-ONE remap decode)"
     "GTK_PROBE_11912|0.6.0|TIU transition probe — the instrument that localized #11912"
@@ -47,7 +52,7 @@ MARKERS=(
     "GTK Crash Recovery|0.7.5|player-facing rescue overlay text"
     "GTK Edition|0.7.2|build self-identification"
     "drop=%llu|0.9.1.1|cellAudio whole-block drop counter -> rpcs3_audio_stat"
-    "g_gfx_shuffle_32->destroy()|0.9.1.2|32-bit gfx byteswap pass torn down with the device (exit abort)"
+    "g_gfx_shuffle_32->destroy()|0.9.1.2|32-bit gfx byteswap pass torn down with the device (exit abort)|armsx3"
     "GTK_PITLINK|0.10.0|GTK Pitlink -- the Engineer's link (eyes/hands/RAM/clock)"
     "etk-pitlink|0.10.0|Pitlink abstract socket name (@etk-pitlink)"
     "pitlink_record_tap|0.10.0|async frame tap at the flip -- no hard sync"
@@ -75,10 +80,23 @@ if [ -n "$WAIVER" ]; then
     MARKERS=( "GTK Edition|0.7.2|build self-identification" )
 fi
 
+# The patch's base lineage, from the literal it adds (empty for pre-0.9 patches,
+# which carry no "(lineage-sha)" suffix).
+LINEAGE=$(grep -E '^\+.*GTK Edition v[0-9]' "$PATCH" 2>/dev/null | grep -oE '\((armsx3|rpcs3)-[0-9a-f]+\)' | tail -1 | sed -E 's/^\(([a-z0-9]+)-.*/\1/')
+[ -n "$LINEAGE" ] && echo "== lineage: $LINEAGE =="
+
+# marker_applies LANE: a marker without a lineage applies to every patch; one with a
+# lineage only to patches on that base.
+marker_applies() { [ -z "$1" ] || [ "$1" = "$LINEAGE" ]; }
+
 fail=0
 echo "== markers in $(basename "$PATCH") =="
 for entry in "${MARKERS[@]}"; do
-    IFS='|' read -r marker since desc <<< "$entry"
+    IFS='|' read -r marker since desc lane <<< "$entry"
+    if ! marker_applies "$lane"; then
+        printf "  n/a   %-24s (%s-only; this patch is on %s)\n" "$marker" "$lane" "${LINEAGE:-a pre-0.9 base}"
+        continue
+    fi
     n=$(grep -cF "$marker" "$PATCH" 2>/dev/null || true)
     if [ "${n:-0}" -gt 0 ]; then
         printf "  ok    %-24s (%s)\n" "$marker" "$n hits"
@@ -115,7 +133,8 @@ fi
 if [ -n "$BIN" ]; then
     echo "== markers in $(basename "$BIN") =="
     for entry in "${MARKERS[@]}"; do
-        IFS='|' read -r marker since desc <<< "$entry"
+        IFS='|' read -r marker since desc lane <<< "$entry"
+        marker_applies "$lane" || continue
         case " $BINARY_EXEMPT " in *" $marker "*) continue ;; esac
         # NB: no `grep -q` here. Under `set -o pipefail`, grep -q exits at the
         # first match, strings dies of SIGPIPE, and pipefail turns that into a
